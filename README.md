@@ -37,10 +37,10 @@ curl -H "Authorization: Bearer $RISK_RUNNER_INGEST_TOKEN" \
 
 ## GitHub Actions
 
-Add the upload step after any scanner. See [.github/workflows/example-security-scan.yml](.github/workflows/example-security-scan.yml) for CodeQL + Trivy + ZAP.
+Add the upload step after any scanner. See [examples/security-scan.yml](examples/security-scan.yml) for CodeQL + Trivy + ZAP, or [examples/juice-shop-security-scan.yml](examples/juice-shop-security-scan.yml) for a ready-made field test.
 
 ```yaml
-- uses: YOUR-ORG/Risk-Runner/action@main
+- uses: MGyawu/Risk-Runner/action@main
   with:
     server-url: ${{ secrets.RISK_RUNNER_URL }}
     token: ${{ secrets.RISK_RUNNER_TOKEN }}

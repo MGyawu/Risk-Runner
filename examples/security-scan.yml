@@ -1,4 +1,4 @@
-# Example: copy into a work repository as .github/workflows/security-scan.yml.
+# Example: copy into a repository you want scanned, as .github/workflows/security-scan.yml.
 # Requires secrets RISK_RUNNER_URL and RISK_RUNNER_TOKEN.
 # Scans run on pushes to the default branch (which updates posture) and weekly.
 name: Security scan
@@ -25,7 +25,7 @@ jobs:
       - uses: github/codeql-action/analyze@v3
         with:
           output: codeql-results
-      - uses: YOUR-ORG/Risk-Runner/action@main
+      - uses: MGyawu/Risk-Runner/action@main
         with:
           server-url: ${{ secrets.RISK_RUNNER_URL }}
           token: ${{ secrets.RISK_RUNNER_TOKEN }}
@@ -41,7 +41,7 @@ jobs:
           scan-type: fs
           format: json
           output: trivy.json
-      - uses: YOUR-ORG/Risk-Runner/action@main
+      - uses: MGyawu/Risk-Runner/action@main
         with:
           server-url: ${{ secrets.RISK_RUNNER_URL }}
           token: ${{ secrets.RISK_RUNNER_TOKEN }}
@@ -56,7 +56,7 @@ jobs:
           cmd_options: "-J report_json.json"
           allow_issue_writing: false
           fail_action: false
-      - uses: YOUR-ORG/Risk-Runner/action@main
+      - uses: MGyawu/Risk-Runner/action@main
         with:
           server-url: ${{ secrets.RISK_RUNNER_URL }}
           token: ${{ secrets.RISK_RUNNER_TOKEN }}
