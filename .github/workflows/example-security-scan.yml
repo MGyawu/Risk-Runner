@@ -1,0 +1,63 @@
+# Example: copy into a work repository as .github/workflows/security-scan.yml.
+# Requires secrets RISK_RUNNER_URL and RISK_RUNNER_TOKEN.
+# Scans run on pushes to the default branch (which updates posture) and weekly.
+name: Security scan
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@v3
+        with:
+          output: codeql-results
+      - uses: YOUR-ORG/Risk-Runner/action@main
+        with:
+          server-url: ${{ secrets.RISK_RUNNER_URL }}
+          token: ${{ secrets.RISK_RUNNER_TOKEN }}
+          report: codeql-results/javascript.sarif
+          scan-type: sast
+
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          format: json
+          output: trivy.json
+      - uses: YOUR-ORG/Risk-Runner/action@main
+        with:
+          server-url: ${{ secrets.RISK_RUNNER_URL }}
+          token: ${{ secrets.RISK_RUNNER_TOKEN }}
+          report: trivy.json
+
+  dast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: https://staging.example.com
+          cmd_options: "-J report_json.json"
+          allow_issue_writing: false
+          fail_action: false
+      - uses: YOUR-ORG/Risk-Runner/action@main
+        with:
+          server-url: ${{ secrets.RISK_RUNNER_URL }}
+          token: ${{ secrets.RISK_RUNNER_TOKEN }}
+          report: report_json.json

@@ -1,0 +1,79 @@
+# Deploys Risk Runner to a single EC2 instance on every push to main (after tests pass).
+#
+# - Signs in to AWS with GitHub OIDC (no AWS keys stored in GitHub).
+# - Sends the deploy through AWS Systems Manager Run Command (SSH can stay closed).
+# - The server reads its secrets from SSM Parameter Store (SecureString, KMS-encrypted).
+#
+# Repository variables (Settings > Secrets and variables > Actions > Variables):
+#   AWS_REGION           e.g. us-east-1
+#   AWS_DEPLOY_ROLE_ARN  IAM role this workflow assumes (see deploy/aws/README.md)
+#   EC2_INSTANCE_ID      e.g. i-0123456789abcdef0
+#   DOMAIN               e.g. riskrunner.example.com (used for the health check)
+#   APP_DIR              optional, defaults to /home/ubuntu/Risk-Runner
+# The deploy job is skipped until EC2_INSTANCE_ID is set.
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-aws
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    if: vars.EC2_INSTANCE_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # lets the job request a GitHub OIDC token for AWS
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy through SSM Run Command
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          APP_DIR: ${{ vars.APP_DIR || '/home/ubuntu/Risk-Runner' }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          script="sudo -u ubuntu -H bash -c 'set -e; cd $APP_DIR; git fetch --quiet origin; git checkout --quiet --force $SHA; AWS_REGION=$AWS_REGION ./deploy/deploy.sh'"
+          params=$(jq -n --arg c "$script" '{commands: [$c], executionTimeout: ["1800"]}')
+          id=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Risk Runner ${SHA:0:7}" \
+            --parameters "$params" \
+            --query Command.CommandId --output text)
+          echo "SSM command $id"
+
+          status=Pending
+          for _ in $(seq 1 150); do
+            sleep 10
+            status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in Success|Failed|Cancelled|TimedOut|Undeliverable|Terminated) break ;; esac
+          done
+
+          echo "::group::Server output"
+          aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text || true
+          echo "::endgroup::"
+          echo "Deploy status: $status"
+          [ "$status" = Success ]
+
+      - name: Health check
+        run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "https://${{ vars.DOMAIN }}/api/health"

@@ -1,0 +1,14 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": ".",
+  "Results": [{
+    "Target": "package-lock.json",
+    "Vulnerabilities": [
+      {"VulnerabilityID": "CVE-2021-44228", "PkgName": "log4j-core", "InstalledVersion": "2.14.1", "FixedVersion": "2.17.1",
+       "Severity": "CRITICAL", "Title": "Log4Shell remote code execution", "CweIDs": ["CWE-502"],
+       "CVSS": {"nvd": {"V3Score": 10.0}}},
+      {"VulnerabilityID": "CVE-2022-25883", "PkgName": "semver", "InstalledVersion": "5.7.1", "FixedVersion": "5.7.2",
+       "Severity": "MEDIUM", "Title": "Regular expression denial of service", "CweIDs": ["CWE-1333"]}
+    ]
+  }]
+}

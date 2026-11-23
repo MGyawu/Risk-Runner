@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [{
+    "tool": {"driver": {"name": "CodeQL", "rules": [
+      {"id": "js/sql-injection", "shortDescription": {"text": "Database query built from user-controlled sources"},
+       "fullDescription": {"text": "Building a database query from user-controlled sources is vulnerable to insertion of malicious code by the user."},
+       "defaultConfiguration": {"level": "error"},
+       "properties": {"security-severity": "8.8", "tags": ["security", "external/cwe/cwe-089"]}},
+      {"id": "js/log-injection", "shortDescription": {"text": "Log injection"},
+       "defaultConfiguration": {"level": "warning"},
+       "properties": {"security-severity": "4.3", "tags": ["security", "external/cwe/cwe-117"]}}
+    ]}},
+    "results": [
+      {"ruleId": "js/sql-injection", "level": "error", "message": {"text": "This query depends on a user-provided value."},
+       "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/api/orders.js"}, "region": {"startLine": 42}}}]},
+      {"ruleId": "js/log-injection", "message": {"text": "Log entry depends on a user-provided value."},
+       "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/util/log.js"}, "region": {"startLine": 7}}}]}
+    ]
+  }]
+}

@@ -1,0 +1,84 @@
+name: Risk Runner upload
+description: Upload SAST, SCA or DAST scan results (SARIF, Trivy, Grype, ZAP JSON) to a Risk Runner server.
+branding:
+  icon: shield
+  color: orange
+inputs:
+  server-url:
+    description: Base URL of your Risk Runner server, e.g. https://risk-runner.example.com
+    required: true
+  token:
+    description: Ingest token (RISK_RUNNER_INGEST_TOKEN on the server). Store it as a repository or org secret.
+    required: true
+  report:
+    description: Path to the scanner report file.
+    required: true
+  scan-type:
+    description: sast, sca or dast. Defaults by format (SARIF->sast, Trivy/Grype->sca, ZAP->dast).
+    required: false
+    default: ""
+  format:
+    description: sarif, trivy, grype or zap. Auto-detected when empty.
+    required: false
+    default: ""
+  tool:
+    description: Override the tool name recorded for these findings.
+    required: false
+    default: ""
+  repository:
+    description: owner/repo the findings belong to.
+    required: false
+    default: ${{ github.repository }}
+  fail-on-error:
+    description: Fail the job if the upload fails.
+    required: false
+    default: "false"
+outputs:
+  risk-score:
+    description: Repository risk score after this upload (0-100).
+    value: ${{ steps.upload.outputs.risk-score }}
+runs:
+  using: composite
+  steps:
+    - id: upload
+      shell: bash
+      env:
+        RR_URL: ${{ inputs.server-url }}
+        RR_TOKEN: ${{ inputs.token }}
+        RR_REPORT: ${{ inputs.report }}
+        RR_SCAN_TYPE: ${{ inputs.scan-type }}
+        RR_FORMAT: ${{ inputs.format }}
+        RR_TOOL: ${{ inputs.tool }}
+        RR_REPO: ${{ inputs.repository }}
+        RR_FAIL: ${{ inputs.fail-on-error }}
+        RR_BRANCH: ${{ github.ref_name }}
+        RR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        RR_SHA: ${{ github.sha }}
+        RR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -uo pipefail
+        fail() { echo "::warning::Risk Runner upload: $1"; [ "$RR_FAIL" = "true" ] && exit 1 || exit 0; }
+        [ -f "$RR_REPORT" ] || fail "report not found at $RR_REPORT"
+
+        args=(--silent --show-error --fail-with-body --retry 3
+              -H "Authorization: Bearer $RR_TOKEN"
+              -F "report=@$RR_REPORT;type=application/json"
+              --form-string "repository=$RR_REPO"
+              --form-string "branch=$RR_BRANCH"
+              --form-string "commit_sha=$RR_SHA"
+              --form-string "workflow_run_url=$RR_RUN_URL")
+        [ -n "$RR_SCAN_TYPE" ] && args+=(--form-string "scan_type=$RR_SCAN_TYPE")
+        [ -n "$RR_FORMAT" ] && args+=(--form-string "format=$RR_FORMAT")
+        [ -n "$RR_TOOL" ] && args+=(--form-string "tool=$RR_TOOL")
+        [ -n "$RR_DEFAULT_BRANCH" ] && args+=(--form-string "default_branch=$RR_DEFAULT_BRANCH")
+
+        if ! body=$(curl "${args[@]}" "${RR_URL%/}/api/v1/ingest"); then
+          fail "server rejected the upload: $body"
+        fi
+        read -r score summary < <(printf '%s' "$body" | python3 -c '
+        import json, sys
+        d = json.load(sys.stdin); s = d["scan"]
+        print(d["repository_risk_score"], "{} ({}): {} findings, {} new, {} fixed".format(s["tool"], s["scan_type"], s["finding_count"], s["new_count"], s["fixed_count"]))')
+        echo "risk-score=$score" >> "$GITHUB_OUTPUT"
+        echo "Risk Runner: $summary. Repository risk score: $score"
+        echo "### Risk Runner: $summary — repository risk **$score**/100" >> "$GITHUB_STEP_SUMMARY"

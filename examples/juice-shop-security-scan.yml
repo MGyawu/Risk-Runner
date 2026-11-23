@@ -1,0 +1,79 @@
+# Field test: scan a fork of OWASP Juice Shop and send results to Risk Runner.
+# Put this file at .github/workflows/risk-runner.yml in your Juice Shop fork, and copy
+# Risk-Runner/action/action.yml to .github/actions/risk-runner-upload/action.yml in the fork.
+# Repository secrets needed: RISK_RUNNER_URL (https://your-domain) and RISK_RUNNER_TOKEN.
+#
+# Juice Shop is deliberately vulnerable. The DAST job runs it only inside the GitHub runner
+# (as a service container on localhost) so it is never exposed to the internet.
+name: Risk Runner field test
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install semgrep
+      - run: semgrep scan --config p/default --sarif --output semgrep.sarif --metrics off
+      - uses: ./.github/actions/risk-runner-upload
+        with:
+          server-url: ${{ secrets.RISK_RUNNER_URL }}
+          token: ${{ secrets.RISK_RUNNER_TOKEN }}
+          report: semgrep.sarif
+          scan-type: sast
+          fail-on-error: "true"
+
+  sca:
+    name: SCA (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Juice Shop does not commit a lockfile, so scan the published image's installed packages.
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: bkimminich/juice-shop:latest
+          format: json
+          output: trivy.json
+          scanners: vuln
+      - uses: ./.github/actions/risk-runner-upload
+        with:
+          server-url: ${{ secrets.RISK_RUNNER_URL }}
+          token: ${{ secrets.RISK_RUNNER_TOKEN }}
+          report: trivy.json
+          fail-on-error: "true"
+
+  dast:
+    name: DAST (ZAP baseline)
+    runs-on: ubuntu-latest
+    services:
+      juice-shop:
+        image: bkimminich/juice-shop:latest
+        ports:
+          - 3000:3000
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for Juice Shop
+        run: |
+          for i in $(seq 1 60); do curl -sf http://localhost:3000 >/dev/null && exit 0; sleep 2; done
+          echo "Juice Shop did not start"; exit 1
+      - uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: http://localhost:3000
+          cmd_options: "-J report_json.json"
+          allow_issue_writing: false
+          fail_action: false
+      - uses: ./.github/actions/risk-runner-upload
+        with:
+          server-url: ${{ secrets.RISK_RUNNER_URL }}
+          token: ${{ secrets.RISK_RUNNER_TOKEN }}
+          report: report_json.json
+          fail-on-error: "true"
