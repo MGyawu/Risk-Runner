@@ -18,7 +18,7 @@ export function OverviewPage() {
       <Empty title="No scans ingested yet">
         <p>
           Add the Risk Runner upload step to a GitHub Actions workflow to send SAST, SCA and DAST results here. See{' '}
-          <code>.github/workflows/example-security-scan.yml</code> in the Risk Runner repository.
+          <code>examples/security-scan.yml</code> in the Risk Runner repository.
         </p>
       </Empty>
     )
