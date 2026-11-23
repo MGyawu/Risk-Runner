@@ -23,6 +23,8 @@ class ParsedFinding:
     installed_version: str | None = None
     fixed_version: str | None = None
     cvss_score: float | None = None
+    # Distinguishes several hits of one rule in one file (tool fingerprint or code snippet).
+    location_key: str | None = None
 
     def fingerprint(self) -> str:
         """Stable identity across scans. Line numbers are excluded so code drift doesn't reopen findings."""
@@ -31,8 +33,20 @@ class ParsedFinding:
         elif self.scan_type == "dast":
             parts = [self.scan_type, self.rule_id or self.title, _strip_query(self.url)]
         else:
-            parts = [self.scan_type, self.rule_id or self.title, self.file_path, self.title]
+            parts = [self.scan_type, self.rule_id or self.title, self.file_path, self.title, self.location_key]
         return hashlib.sha256("|".join(p or "" for p in parts).encode()).hexdigest()
+
+
+def disambiguate(findings: list[ParsedFinding]) -> None:
+    """Number repeated identical location keys (same rule, file and code) so each hit is kept."""
+    seen: dict[tuple, int] = {}
+    for f in findings:
+        if f.scan_type != "sast" or f.location_key is None:
+            continue  # only SARIF-sourced SAST hits carry a location key
+        key = (f.rule_id, f.file_path, f.location_key)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            f.location_key = f"{f.location_key}#{seen[key]}"
 
 
 def normalize_severity(value: object) -> str:

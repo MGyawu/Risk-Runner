@@ -1,6 +1,24 @@
 """SARIF 2.1.0 — CodeQL, Semgrep, Bandit, Checkmarx, Snyk Code, ZAP (sarif), etc."""
 
-from .base import ParsedFinding, clean_cwes, find_cve, normalize_severity, severity_from_cvss
+import re
+
+from .base import ParsedFinding, clean_cwes, disambiguate, find_cve, normalize_severity, severity_from_cvss
+
+# Values some tools put in `fingerprints` when they have no real one (Semgrep OSS).
+PLACEHOLDER_FINGERPRINTS = {"requires login", ""}
+
+
+def _location_key(res: dict, region: dict) -> str | None:
+    """Stable identity for one hit: tool fingerprint, else the flagged code (not the line number,
+    so findings survive code moving). Empty when neither exists; repeats are numbered later."""
+    for source in (res.get("partialFingerprints") or {}, res.get("fingerprints") or {}):
+        for value in source.values():
+            if isinstance(value, str) and value.strip() not in PLACEHOLDER_FINGERPRINTS:
+                return value
+    snippet = (region.get("snippet") or {}).get("text")
+    if snippet and snippet.strip():
+        return re.sub(r"\s+", " ", snippet).strip()
+    return ""
 
 
 def parse_sarif(doc: dict, scan_type: str) -> list[ParsedFinding]:
@@ -41,15 +59,17 @@ def parse_sarif(doc: dict, scan_type: str) -> list[ParsedFinding]:
             full = (rule.get("fullDescription") or {}).get("text") or (rule.get("help") or {}).get("text")
 
             file_path = line = url = None
+            region: dict = {}
             locs = res.get("locations") or []
             if locs:
                 phys = locs[0].get("physicalLocation") or {}
+                region = phys.get("region") or {}
                 uri = (phys.get("artifactLocation") or {}).get("uri")
                 if uri and uri.startswith(("http://", "https://")):
                     url = uri
                 else:
                     file_path = uri
-                line = (phys.get("region") or {}).get("startLine")
+                line = region.get("startLine")
             # ZAP SARIF puts URLs in webRequest
             if not url and (req := res.get("webRequest")):
                 url = req.get("target")
@@ -69,6 +89,8 @@ def parse_sarif(doc: dict, scan_type: str) -> list[ParsedFinding]:
                     line=line,
                     url=url,
                     cvss_score=cvss if find_cve(rule_id, message) else None,
+                    location_key=_location_key(res, region),
                 )
             )
+    disambiguate(findings)
     return findings

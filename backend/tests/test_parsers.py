@@ -51,3 +51,33 @@ def test_fingerprint_ignores_line_and_query():
     moved["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startLine"] = 99
     _, _, b = parse_report(moved)
     assert a[0].fingerprint() == b[0].fingerprint()
+
+
+def _sarif_hits(*hits):
+    """hits: (file, line, snippet or None)"""
+    results = []
+    for file, line, snippet in hits:
+        region = {"startLine": line, **({"snippet": {"text": snippet}} if snippet else {})}
+        results.append({
+            "ruleId": "rule.x",
+            "message": {"text": "Same message"},
+            "fingerprints": {"matchBasedId/v1": "requires login"},
+            "locations": [{"physicalLocation": {"artifactLocation": {"uri": file}, "region": region}}],
+        })
+    return {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "Semgrep OSS"}}, "results": results}]}
+
+
+def test_multiple_hits_of_one_rule_in_one_file_are_kept():
+    _, _, findings = parse_report(_sarif_hits(("a.py", 1, "eval(x)"), ("a.py", 9, "eval(y)"), ("a.py", 20, "eval(x)")))
+    assert len({f.fingerprint() for f in findings}) == 3
+
+
+def test_snippet_fingerprint_survives_line_moves():
+    _, _, before = parse_report(_sarif_hits(("a.py", 1, "eval(x)"), ("a.py", 9, "eval(y)")))
+    _, _, after = parse_report(_sarif_hits(("a.py", 30, "eval(x)"), ("a.py", 41, "eval(y)")))
+    assert {f.fingerprint() for f in before} == {f.fingerprint() for f in after}
+
+
+def test_hits_without_snippets_are_kept_and_numbered():
+    _, _, findings = parse_report(_sarif_hits(("a.py", 1, None), ("a.py", 9, None)))
+    assert len({f.fingerprint() for f in findings}) == 2
