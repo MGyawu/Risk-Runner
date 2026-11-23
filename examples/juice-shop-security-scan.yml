@@ -21,6 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: pip install semgrep
       - run: semgrep scan --config p/default --sarif --output semgrep.sarif --metrics off
       - uses: ./.github/actions/risk-runner-upload
@@ -37,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Juice Shop does not commit a lockfile, so scan the published image's installed packages.
-      - uses: aquasecurity/trivy-action@0.28.0
+      - uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: bkimminich/juice-shop:latest
