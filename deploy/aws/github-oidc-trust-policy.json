@@ -10,7 +10,10 @@
       "Condition": {
         "StringEquals": {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          "token.actions.githubusercontent.com:sub": "repo:GITHUB_OWNER/Risk-Runner:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub": [
+            "repo:GITHUB_OWNER/Risk-Runner:ref:refs/heads/main",
+            "repo:GITHUB_OWNER@OWNER_ID/Risk-Runner@REPO_ID:ref:refs/heads/main"
+          ]
         }
       }
     }

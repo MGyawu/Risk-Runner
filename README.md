@@ -47,6 +47,15 @@ Add the upload step after any scanner. See [examples/security-scan.yml](examples
     report: trivy.json          # format and scan type are auto-detected
 ```
 
+Things to get right in each scanned repository (details in [deploy/aws/README.md § C](deploy/aws/README.md#c-connecting-repositories-to-scan)):
+
+- `RISK_RUNNER_URL` and `RISK_RUNNER_TOKEN` are repository **secrets**, not variables. The token is the server's **ingest** token, not the API token.
+- The scanner must write a report file (SARIF, Trivy/Grype JSON or ZAP JSON). Console output isn't uploaded.
+- If the scanner fails the job on findings (`semgrep --error`, Trivy `exit-code: 1`), give the upload step `if: always()` or generate the report in a separate, non-failing step first.
+- Run uploads on a normal runner. The action needs bash, curl and python3, which minimal scanner containers may not include.
+- A rejected upload only shows a warning by default. Check the step log, or set `fail-on-error: "true"`.
+- Only default-branch scans change findings.
+
 | Format | Typical tools | Default type |
 |---|---|---|
 | SARIF 2.1.0 | CodeQL, Semgrep, Bandit, Snyk Code, Checkmarx | `sast` (override with `scan-type`) |
