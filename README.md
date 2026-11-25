@@ -25,7 +25,7 @@ Or build the frontend once (`npm run build`) and the backend serves it at `http:
 
 Docker (with Postgres): `cp .env.example .env`, edit it, then `docker compose up --build`.
 
-Single-server deployment with HTTPS (e.g. AWS EC2): set `DOMAIN` and `POSTGRES_PASSWORD` in `.env`, then `docker compose -f docker-compose.aws.yml up -d --build`. Caddy obtains a Let's Encrypt certificate automatically. For automated deploys to AWS on every push to `main` (GitHub OIDC, SSM, Parameter Store), follow [deploy/aws/README.md](deploy/aws/README.md). A field-test workflow that scans OWASP Juice Shop is in [examples/juice-shop-security-scan.yml](examples/juice-shop-security-scan.yml).
+Server deployment with HTTPS (e.g. AWS EC2): set `DOMAIN` and `RISK_RUNNER_DATABASE_URL` (a managed Postgres such as Amazon RDS) in `.env`, then `docker compose -f docker-compose.aws.yml up -d --build`. Caddy obtains a Let's Encrypt certificate automatically. For automated deploys to AWS on every push to `main` (GitHub OIDC, SSM, Parameter Store, RDS), and optional serverless ingestion (S3 + SQS + Lambda), follow [deploy/aws/README.md](deploy/aws/README.md). A field-test workflow that scans OWASP Juice Shop is in [examples/juice-shop-security-scan.yml](examples/juice-shop-security-scan.yml).
 
 Send a report by hand:
 
@@ -46,6 +46,8 @@ Add the upload step after any scanner. See [examples/security-scan.yml](examples
     token: ${{ secrets.RISK_RUNNER_TOKEN }}
     report: trivy.json          # format and scan type are auto-detected
 ```
+
+With [serverless ingestion](deploy/aws/README.md#h-serverless-ingestion-lambda), use `ingest-url: ${{ secrets.RISK_RUNNER_INGEST_URL }}` instead of `server-url`. The report is uploaded to S3 and processed by Lambda, and the step waits for the result (`wait-seconds`, default 120).
 
 Things to get right in each scanned repository (details in [deploy/aws/README.md § C](deploy/aws/README.md#c-connecting-repositories-to-scan)):
 
@@ -99,6 +101,8 @@ All settings are environment variables prefixed `RISK_RUNNER_` (see [.env.exampl
 | `INGEST_TOKEN` | Bearer token required by `/api/v1/ingest`. **Set this in any shared deployment.** |
 | `API_TOKEN` | Optional bearer token for the dashboard/read API (enter it via **Token** in the UI). |
 | `DATABASE_URL` | SQLAlchemy URL. Defaults to SQLite; use `postgresql+psycopg://…` in production. |
+| `PENDING_ENRICHMENT_MINUTES` | How often the server enriches CVEs that arrived through serverless ingestion (default 10). |
+| `REPORTS_BUCKET`, `DB_POOL` | Set by the serverless stack for its Lambda functions. |
 | `AI_ENABLED`, `AI_MODEL`, `AI_EFFORT` | Claude analysis settings. |
 | `NVD_API_KEY`, `ENRICHMENT_INTERVAL_HOURS` | Threat intel settings. |
 

@@ -1,0 +1,276 @@
+# Serverless ingestion for Risk Runner. Deploy with ./deploy.sh (see deploy/aws/README.md, part H).
+#
+#   GitHub Action ─POST /uploads─▶ ApiFunction ─▶ presigned S3 POST
+#   GitHub Action ─report─▶ ReportsBucket/reports/ ─▶ IngestQueue ─▶ ProcessorFunction (VPC) ─▶ RDS
+#   GitHub Action ─GET /uploads/{id}─▶ ApiFunction ─▶ ReportsBucket/results/
+#
+# The processor has no internet access (no NAT gateway). It reaches S3 through a free gateway
+# endpoint and RDS inside the VPC. Threat-intel enrichment stays on the web server.
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Risk Runner serverless ingestion (S3 + SQS + Lambda)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC of the RDS instance.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the processor (the RDS instance's subnets).
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Description: Route tables of those subnets, for the S3 gateway endpoint.
+  CreateS3Endpoint:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: false if the VPC already has an S3 gateway endpoint.
+  DatabaseSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group of the RDS instance. The stack adds an inbound rule from the processor.
+  DatabaseUrl:
+    Type: String
+    NoEcho: true
+    Description: SQLAlchemy URL, e.g. postgresql+psycopg://risk:...@host:5432/risk_runner?sslmode=require
+  IngestToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Same value as RISK_RUNNER_INGEST_TOKEN on the server.
+  ReportRetentionDays:
+    Type: Number
+    Default: 90
+
+Conditions:
+  MakeS3Endpoint: !Equals [!Ref CreateS3Endpoint, "true"]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    CodeUri: .build/ingest
+    Environment:
+      Variables:
+        RISK_RUNNER_REPORTS_BUCKET: !Sub "${AWS::StackName}-reports-${AWS::AccountId}-${AWS::Region}"
+        RISK_RUNNER_ENRICHMENT_ENABLED: "false"
+
+Resources:
+  # ------------------------------------------------------------ storage and queue
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IngestQueuePolicy
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-reports-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-uploads
+            Status: Enabled
+            ExpirationInDays: !Ref ReportRetentionDays
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt IngestQueue.Arn
+            Filter:
+              S3Key:
+                Rules: [{Name: prefix, Value: reports/}]
+
+  ReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ReportsBucket.Arn
+              - !Sub "${ReportsBucket.Arn}/*"
+            Condition: {Bool: {aws:SecureTransport: "false"}}
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-queue"
+      VisibilityTimeout: 1800 # 6x the processor timeout
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IngestQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowReportsBucket
+            Effect: Allow
+            Principal: {Service: s3.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnEquals: {aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-reports-${AWS::AccountId}-${AWS::Region}"}
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+
+  # ------------------------------------------------------------ networking
+  ProcessorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Risk Runner ingest processor (Lambda)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - Description: Postgres
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroupId
+        - Description: HTTPS to S3 through the gateway endpoint (there is no internet route)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  DatabaseIngressFromProcessor:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroupId
+      Description: Risk Runner ingest processor (Lambda)
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ProcessorSecurityGroup
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: MakeS3Endpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+  # ------------------------------------------------------------ functions
+  IngestApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-api"
+      Handler: risk_runner.lambda_handlers.api_handler
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          RISK_RUNNER_INGEST_TOKEN: !Ref IngestToken
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [s3:PutObject]
+              Resource:
+                - !Sub "${ReportsBucket.Arn}/meta/*"
+                - !Sub "${ReportsBucket.Arn}/reports/*" # signs the presigned POST
+            - Effect: Allow
+              Action: [s3:GetObject]
+              Resource:
+                - !Sub "${ReportsBucket.Arn}/meta/*"
+                - !Sub "${ReportsBucket.Arn}/results/*"
+            - Effect: Allow
+              Action: [s3:ListBucket] # missing objects return 404 instead of 403
+              Resource: !GetAtt ReportsBucket.Arn
+      Events:
+        CreateUpload:
+          Type: HttpApi
+          Properties: {ApiId: !Ref IngestApi, Method: POST, Path: /uploads}
+        GetUpload:
+          Type: HttpApi
+          Properties: {ApiId: !Ref IngestApi, Method: GET, Path: "/uploads/{id}"}
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-processor"
+      Handler: risk_runner.lambda_handlers.process_handler
+      MemorySize: 1024
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds: [!Ref ProcessorSecurityGroup]
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          RISK_RUNNER_DATABASE_URL: !Ref DatabaseUrl
+          RISK_RUNNER_DB_POOL: none
+      Policies:
+        - VPCAccessPolicy: {} # network interfaces for running inside the VPC
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [s3:GetObject]
+              Resource:
+                - !Sub "${ReportsBucket.Arn}/meta/*"
+                - !Sub "${ReportsBucket.Arn}/reports/*"
+                - !Sub "${ReportsBucket.Arn}/results/*"
+            - Effect: Allow
+              Action: [s3:PutObject]
+              Resource: !Sub "${ReportsBucket.Arn}/results/*"
+            - Effect: Allow
+              Action: [s3:ListBucket]
+              Resource: !GetAtt ReportsBucket.Arn
+      Events:
+        Reports:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 2 # lowest allowed; same-repo ingests are serialized by a DB lock
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-api"
+      RetentionInDays: 30
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-processor"
+      RetentionInDays: 30
+
+Outputs:
+  IngestUrl:
+    Description: Use as the ingest-url input of the GitHub Action.
+    Value: !Sub "https://${IngestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+  ReportsBucketName:
+    Value: !Ref ReportsBucket
+  DeadLetterQueueUrl:
+    Description: Reports that failed three times end up here.
+    Value: !Ref DeadLetterQueue

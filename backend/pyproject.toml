@@ -23,6 +23,8 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "boto3>=1.44.12",
+    "moto[s3]>=5",
     "pytest>=9.2.0",
 ]
 

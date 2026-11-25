@@ -1,8 +1,10 @@
 # Deploying Risk Runner to AWS
 
-One EC2 instance runs Caddy (HTTPS), Risk Runner and Postgres with
-[docker-compose.aws.yml](../../docker-compose.aws.yml). After a one-time setup, every push to
-`main` is tested and deployed by [.github/workflows/deploy-aws.yml](../../.github/workflows/deploy-aws.yml):
+One EC2 instance runs Caddy (HTTPS) and the Risk Runner web app with
+[docker-compose.aws.yml](../../docker-compose.aws.yml). The data lives in **Amazon RDS for
+PostgreSQL**, so it survives the instance. Optionally, scanner reports are ingested by **Lambda**
+instead of the web server ([part H](#h-serverless-ingestion-lambda)). After a one-time setup,
+every push to `main` is tested and deployed by [.github/workflows/deploy-aws.yml](../../.github/workflows/deploy-aws.yml):
 
 ```
 push to main ─▶ CI tests ─▶ GitHub OIDC token ─▶ AWS role (no stored keys)
@@ -11,7 +13,14 @@ push to main ─▶ CI tests ─▶ GitHub OIDC token ─▶ AWS role (no stored
                          EC2: git checkout <sha> ─▶ deploy/deploy.sh
                               reads secrets from SSM Parameter Store (KMS-encrypted)
                               docker compose up --build ─▶ health check
+
+GitHub Actions scans ──▶ EC2 web app ─────────────────────────┐
+         or (part H) ──▶ API Lambda ─▶ S3 ─▶ SQS ─▶ Lambda ────┴─▶ RDS PostgreSQL
 ```
+
+**Already running the older single-server setup** (Postgres in a container on the instance)?
+Follow [I. Moving an existing deployment to RDS and Lambda](#i-moving-an-existing-deployment-to-rds-and-lambda)
+instead of part A.
 
 Contents: [Lessons learned](#lessons-learned-things-to-watch-out-for) ·
 [A. One-time setup](#a-one-time-setup) ·
@@ -20,7 +29,9 @@ Contents: [Lessons learned](#lessons-learned-things-to-watch-out-for) ·
 [D. Field test with Juice Shop](#d-field-test-with-owasp-juice-shop) ·
 [E. What to check](#e-what-to-check) ·
 [F. Troubleshooting](#f-troubleshooting) ·
-[G. Pausing, tearing down and rebuilding](#g-pausing-tearing-down-and-rebuilding)
+[G. Pausing, tearing down and rebuilding](#g-pausing-tearing-down-and-rebuilding) ·
+[H. Serverless ingestion](#h-serverless-ingestion-lambda) ·
+[I. Moving an existing deployment](#i-moving-an-existing-deployment-to-rds-and-lambda)
 
 ## Before you start
 
@@ -35,6 +46,7 @@ Replace these everywhere they appear, in commands and in the JSON policy files:
 | `GITHUB_OWNER` | your GitHub user or org | Your repository URL |
 | `OWNER_ID`, `REPO_ID` | numeric GitHub IDs | See step 9 |
 | `INSTANCE_ID` | `i-0abc…` | EC2 → Instances (after step 3) |
+| `DB_ENDPOINT` | `risk-runner.abc123.us-east-2.rds.amazonaws.com` | RDS → Databases → risk-runner → Connectivity (after step 5a) |
 | `YOUR_DOMAIN` | `riskrunner.example.com` | Chosen in step 4 |
 
 Before running a command or saving a policy, check that no placeholder is left in it. A
@@ -96,9 +108,13 @@ for them as you go. [F. Troubleshooting](#f-troubleshooting) has the fix for eac
   failing to get a certificate. The Caddy log shows why.
 
 **Secrets and the server**
-- **Generated secrets change every time you run the commands.** Rerunning the step 5 block
-  creates new tokens and a new database password. A new `POSTGRES_PASSWORD` after the first
-  deploy locks the app out of its own database. Rerun only the line you mean to change.
+- **Generated secrets change every time you run the commands.** Rerunning the step 5b block
+  creates new tokens. Rerun only the line you mean to change.
+- **The database URL holds the RDS password.** Changing the password in RDS without updating
+  `RISK_RUNNER_DATABASE_URL` (or the reverse) locks the app out. Change both, then redeploy the
+  server and, if you use it, the serverless stack.
+- **Use a self-managed RDS password.** If RDS manages the password in Secrets Manager, it rotates
+  it and the stored URL stops working.
 - **Parameters are read only at deploy time.** After changing one, redeploy.
 - **Run server commands on the server.** Steps 6–7 run in Session Manager on the instance (the
   prompt shows `ubuntu@ip-…`), not in CloudShell. Paste one command at a time; two commands run
@@ -118,8 +134,9 @@ for them as you go. [F. Troubleshooting](#f-troubleshooting) has the fix for eac
 - **An empty dashboard usually means no token.** Click **Token** and paste the API token.
 
 **Shutting down**
-- **Stopping isn't terminating.** A stopped instance keeps its data and its Elastic IP. A
-  terminated instance loses the database.
+- **Stopping isn't terminating.** A stopped instance keeps its disk and its Elastic IP. The data
+  is in RDS, so even a terminated instance doesn't lose findings.
+- **A stopped RDS database starts again by itself after 7 days**, and is billed from then on.
 - **Disable the deploy workflow before stopping or deleting the instance**, or every push to
   `main` produces a failed deploy. Scanned repos will also show upload warnings until their
   uploads are disabled or the server is back.
@@ -181,14 +198,39 @@ Don't use the instance's `ec2-….amazonaws.com` name, because Let's Encrypt won
 certificates for it. Also, `nslookup <ip>` performs a reverse lookup and returns that AWS name.
 It doesn't test your hostname.
 
-### 5. Store the secrets in Parameter Store
-In CloudShell (check the region selector first) or on your machine:
+### 5. Create the database and store the secrets
+
+#### 5a. Create the RDS database
+First generate the database password in CloudShell (check the region selector) and keep it for
+step 5b. Hex characters only, so it's safe inside a URL:
+
+```bash
+DB_PASSWORD=$(openssl rand -hex 24); echo "$DB_PASSWORD"
+```
+
+Then RDS → Databases → **Create database**, in the same region as the instance:
+- **Creation method:** Standard create (called *Full configuration* in newer consoles). **Engine:** PostgreSQL, version 17.
+- **Template:** Free tier if it's offered, otherwise Dev/Test. Choose **Single-AZ** if asked.
+- **DB instance identifier:** `risk-runner`. The serverless deploy script looks the database up by this name.
+- **Master username:** `risk`. **Credentials management: Self managed**, and paste `$DB_PASSWORD`.
+  Don't choose *Managed in AWS Secrets Manager* (see [Lessons learned](#lessons-learned-things-to-watch-out-for)).
+- **Instance class:** Burstable → **db.t4g.micro**. **Storage:** gp3, 20 GiB. Under storage
+  autoscaling, a maximum of 50 GiB is plenty.
+- **Connectivity:** choose **Connect to an EC2 compute resource** and pick your instance. This
+  puts the database in the instance's VPC and creates the security groups that let only the
+  instance reach port 5432. **Public access: No.**
+- **Additional configuration:** **Initial database name** `risk_runner` (without it, no database
+  is created). Backup retention 7 days, encryption on, **Enable deletion protection** on.
+- Create. It takes about 10 minutes. Then copy the **endpoint** from the Connectivity & security tab.
+
+#### 5b. Store the secrets in Parameter Store
+In the same CloudShell session (so `$DB_PASSWORD` is still set):
 
 ```bash
 REGION=REGION   # your region, e.g. us-east-2
 put() { aws ssm put-parameter --region "$REGION" --type SecureString --overwrite --name "/risk-runner/$1" --value "$2"; }
 put DOMAIN YOUR_DOMAIN
-put POSTGRES_PASSWORD "$(openssl rand -hex 24)"
+put RISK_RUNNER_DATABASE_URL "postgresql+psycopg://risk:$DB_PASSWORD@DB_ENDPOINT:5432/risk_runner?sslmode=require"
 put RISK_RUNNER_INGEST_TOKEN "$(openssl rand -hex 32)"
 put RISK_RUNNER_API_TOKEN "$(openssl rand -hex 32)"
 # Optional: Claude analysis
@@ -201,13 +243,14 @@ put RISK_RUNNER_API_TOKEN "$(openssl rand -hex 32)"
   `aws ssm get-parameter --region "$REGION" --with-decryption --name /risk-runner/<NAME> --query Parameter.Value --output text`.
 - **`DOMAIN` must be your real hostname from step 4.** If it's wrong, Caddy requests a
   certificate for a host that isn't your server and HTTPS fails.
-- **Set `POSTGRES_PASSWORD` once.** Postgres stores its password when the database volume is
-  first created. Changing the parameter later makes the app unable to connect. Don't rerun
-  the whole block after the first deploy; to change a single value, run just its `put` line.
+- **Replace `DB_ENDPOINT`** with the endpoint from step 5a. A wrong host shows up as the app
+  failing its health check during the first deploy.
+- **Don't rerun the whole block later.** It creates new tokens that scanned repos and the
+  dashboard don't know about. To change a single value, run just its `put` line.
 - Every `/risk-runner/<NAME>` parameter becomes `NAME=value` in the server's `.env`, so any
   `RISK_RUNNER_*` setting can be added the same way. Avoid `$` in values (Docker Compose expands it).
 - Check what's stored: `aws ssm get-parameters-by-path --region "$REGION" --path /risk-runner --query 'Parameters[].Name'`.
-  This should list at least `DOMAIN`, `POSTGRES_PASSWORD`, `RISK_RUNNER_INGEST_TOKEN` and `RISK_RUNNER_API_TOKEN`.
+  This should list at least `DOMAIN`, `RISK_RUNNER_DATABASE_URL`, `RISK_RUNNER_INGEST_TOKEN` and `RISK_RUNNER_API_TOKEN`.
 
 ### 6. Clone the repo on the server
 Connect with EC2 → the instance → **Connect → Session Manager → Connect**. This opens a shell on
@@ -305,8 +348,11 @@ Enter plain values, with no `https://`, quotes or trailing spaces. `DOMAIN` must
   The server reads Parameter Store only during a deploy, so redeploy after changing any parameter.
 - The server's output appears in the "Server output" group of the *Deploy through SSM Run Command* step.
 - To rotate the ingest or API token: `put` the new value, redeploy, then update every place that
-  uses it (`RISK_RUNNER_TOKEN` secrets in scanned repos, the dashboard's Token button). Don't
-  rotate `POSTGRES_PASSWORD` this way (see step 5).
+  uses it (`RISK_RUNNER_TOKEN` secrets in scanned repos, the dashboard's Token button). If you
+  use serverless ingestion, redeploy that stack too ([part H](#h-serverless-ingestion-lambda)),
+  since the Lambda gets the token at deploy time.
+- To change the database password: RDS → Modify → new master password, then `put` the new
+  `RISK_RUNNER_DATABASE_URL`, then redeploy the server (and the serverless stack).
 
 Open `https://YOUR_DOMAIN`, click **Token** (top right), and paste the `RISK_RUNNER_API_TOKEN`
 value. Until you do, the dashboard stays empty, because the read API requires the token.
@@ -334,6 +380,9 @@ In the scanned repository, go to Settings → Secrets and variables → Actions 
 
 Use the ingest token here, not the API token. Paste only the 64 hex characters, with no quotes,
 spaces or line breaks, and copy it from the region your server uses.
+
+With [serverless ingestion](#h-serverless-ingestion-lambda), also add `RISK_RUNNER_INGEST_URL`
+(the stack's ingest URL) and pass it to the upload step as `ingest-url`. The token stays the same.
 
 ### 2. Make the workflow produce a report and upload it
 Having the secrets isn't enough. Each scan job needs to:
@@ -467,7 +516,9 @@ inside the GitHub runner and scans `localhost`.
 | `git clone` asks for a password | The URL is malformed (often two commands pasted together) or the repo is private. Ctrl+C, then see step 6. |
 | `deploy.sh`: *"Missing parameter /risk-runner/DOMAIN"* (or another name) | The parameters are in a different region, or that one wasn't saved. On the instance: `aws ssm get-parameters-by-path --region REGION --path /risk-runner --query 'Parameters[].Name'`. An empty list means a region mismatch: recreate the parameters in the right region and delete the others. |
 | `deploy.sh`: AccessDenied reading parameters | The instance role's inline policy has the wrong region or account ID, or a placeholder left in it. |
-| App unhealthy after changing `POSTGRES_PASSWORD` | Put the old value back. Otherwise the database volume must be recreated, which deletes all data. |
+| `deploy.sh`: *"Missing parameter /risk-runner/RISK_RUNNER_DATABASE_URL"* | Step 5b wasn't done for this parameter, or it's in another region. |
+| App unhealthy; its log (`docker compose -f docker-compose.aws.yml logs risk-runner --tail 80`) shows *"connection timed out"* to the RDS host | The database's security group doesn't allow the instance. RDS → the database → Actions → **Set up EC2 connection** → pick the instance. |
+| App log: *"password authentication failed"* or *"database "risk_runner" does not exist"* | The password in `RISK_RUNNER_DATABASE_URL` doesn't match RDS, or no initial database name was set in step 5a. Fix the URL, or create the database (part I, step 3 shows how to run `psql`), then redeploy. |
 | Deploy workflow: *"Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity"* | The trust policy doesn't match what GitHub sent. In the deploy region, open CloudTrail → Event history → Event name `AssumeRoleWithWebIdentity`. The event's `userIdentity.userName` is the exact `sub` GitHub sent; make the trust policy match it. Also check the provider ARN, the audience and the `AWS_DEPLOY_ROLE_ARN` variable. |
 | Deploy workflow: *"not authorized to perform: ssm:SendCommand … because no identity-based policy allows"* | The deploy role's inline policy still says `INSTANCE_ID` (or has the wrong region or account). Fill it in and save. |
 | Health check: *"TLS connect error … tlsv1 alert internal error"* | Caddy has no certificate yet. On the instance, run `docker compose -f docker-compose.aws.yml logs caddy --tail 100`. A *"Timeout during connect"* for a different hostname or IP means `/risk-runner/DOMAIN` is wrong: fix it and redeploy. A timeout for your own IP means ports 80/443 are blocked. *rateLimited* means a Let's Encrypt limit: switch to `….nip.io` (update the parameter and the variable, then redeploy). If the log shows the certificate is still being obtained, wait and rerun. |
@@ -479,9 +530,20 @@ inside the GitHub runner and scans `localhost`.
 
 ## G. Pausing, tearing down and rebuilding
 
-Rough monthly costs: about $15 for a running t3.small, about $1.60 for the 20 GB disk, and
-about $3.60 for the public IPv4 address (billed whether or not the instance is running).
-Parameters, IAM roles and the OIDC provider are free.
+Rough monthly costs (us-east-1 list prices):
+
+| Item | Per month |
+|---|---|
+| EC2 t3.small, running | ~$15 |
+| EC2 20 GB disk | ~$1.60 |
+| Public IPv4 address (billed even while the instance is stopped) | ~$3.60 |
+| RDS db.t4g.micro, Single-AZ, running (free tier covers it on eligible accounts) | ~$11.70 |
+| RDS 20 GB storage and backups | ~$2.30 |
+| Serverless ingestion (Lambda, SQS, S3, API), at about 1,000 uploads | under $1 |
+
+Parameters, IAM roles, the OIDC provider and the S3 gateway endpoint are free. Without the
+Postgres container, a smaller instance (t3.micro, ~$7.60) may be enough. The frontend build on a
+1 GB instance can run out of memory, so add swap if you try it.
 
 ### Pause (keeps all data and settings)
 
@@ -490,25 +552,33 @@ Parameters, IAM roles and the OIDC provider are free.
 2. Optionally disable the scan workflows in scanned repositories. Otherwise their uploads warn,
    or fail if `fail-on-error` is set.
 3. EC2 → the instance → Instance state → **Stop**. Don't terminate it.
+4. RDS → the database → Actions → **Stop temporarily**. RDS starts it again after 7 days, so
+   repeat this weekly or take a snapshot and delete it for longer pauses.
 
-While paused, you pay only for the disk and the Elastic IP, about $5 a month.
+While paused, you pay only for the EC2 disk, the Elastic IP and the RDS storage, about $7 a month.
 
 **Resume:**
-1. EC2 → Instance state → **Start**. The Elastic IP, hostname, certificate and database are all
-   kept, and the containers restart on their own.
+1. RDS → the database → Actions → **Start**, and wait until it's *Available*. Then EC2 →
+   Instance state → **Start**. The Elastic IP, hostname, certificate and data are all kept, and
+   the containers restart on their own.
 2. After a minute or two, check `https://YOUR_DOMAIN/api/health`.
 3. Re-enable the **Deploy to AWS** workflow and run it once, which deploys any commits pushed
    while paused. Re-enable any scan workflows you disabled.
 
 ### Tear down but keep the setup reusable (about $0 a month)
 
-This deletes the server and its database: findings, triage decisions and business context.
+This deletes the server and the database: findings, triage decisions and business context.
 Findings come back on the next scans; triage decisions and business context must be re-entered.
 
 1. Disable the **Deploy to AWS** workflow (or unset `EC2_INSTANCE_ID` so the deploy job skips).
-2. EC2 → the instance → Instance state → **Terminate**.
-3. EC2 → Elastic IPs → select it → Actions → **Release Elastic IP addresses**.
-4. Keep the parameters, both IAM roles and the OIDC provider. They cost nothing and make
+2. If you use serverless ingestion: CloudFormation → `risk-runner-ingest` → **Delete**. Empty its
+   reports bucket first if the delete stops on it.
+3. EC2 → the instance → Instance state → **Terminate**.
+4. EC2 → Elastic IPs → select it → Actions → **Release Elastic IP addresses**.
+5. RDS → the database → Modify → turn off deletion protection → Apply immediately. Then Actions
+   → **Delete**. Take a final snapshot if you might want the data back (snapshots cost about
+   $0.095 per GB-month).
+6. Keep the parameters, both IAM roles and the OIDC provider. They cost nothing and make
    rebuilding quick.
 
 **Rebuild later:**
@@ -516,10 +586,12 @@ Findings come back on the next scans; triage decisions and business context must
 2. The IP is new, so update the hostname. With your own domain, point the A record at the new
    IP. With sslip.io or nip.io, the hostname changes: update the `/risk-runner/DOMAIN` parameter
    and the `DOMAIN` variable, and `RISK_RUNNER_URL` in scanned repositories.
-3. Update `INSTANCE_ID` in the deploy role's inline policy and the `EC2_INSTANCE_ID` variable.
-4. Steps 6–7: clone and deploy by hand. The existing `POSTGRES_PASSWORD` is fine, because the
-   database is created fresh.
-5. Re-enable the **Deploy to AWS** workflow. The tokens are unchanged, so the scanned
+3. Step 5a: create the database again (or restore the final snapshot with the identifier
+   `risk-runner`, then **Set up EC2 connection** to the new instance). Update
+   `RISK_RUNNER_DATABASE_URL` with the new endpoint and password.
+4. Update `INSTANCE_ID` in the deploy role's inline policy and the `EC2_INSTANCE_ID` variable.
+5. Steps 6–7: clone and deploy by hand. Redeploy the serverless stack if you use it.
+6. Re-enable the **Deploy to AWS** workflow. The tokens are unchanged, so the scanned
    repositories' `RISK_RUNNER_TOKEN` and your dashboard Token still work.
 
 ### Remove everything
@@ -529,6 +601,206 @@ Tear down as above, then:
   ```bash
   aws ssm delete-parameters --region REGION --names $(aws ssm get-parameters-by-path --region REGION --path /risk-runner --query 'Parameters[].Name' --output text)
   ```
+- Delete the `risk-runner-artifacts-ACCOUNT_ID-REGION` S3 bucket (serverless deploy packages).
 - Delete both IAM roles and, if nothing else uses it, the `token.actions.githubusercontent.com` identity provider.
-- Delete the `AWS_REGION`, `AWS_DEPLOY_ROLE_ARN`, `EC2_INSTANCE_ID` and `DOMAIN` variables.
-- Remove the `RISK_RUNNER_URL` and `RISK_RUNNER_TOKEN` secrets and the upload steps from scanned repositories.
+- Delete the `AWS_REGION`, `AWS_DEPLOY_ROLE_ARN`, `EC2_INSTANCE_ID`, `DOMAIN` and `SERVERLESS_INGEST` variables.
+- Remove the `RISK_RUNNER_URL`, `RISK_RUNNER_INGEST_URL` and `RISK_RUNNER_TOKEN` secrets and the upload steps from scanned repositories.
+
+## H. Serverless ingestion (Lambda)
+
+Optional. Reports go from GitHub Actions to S3 and are processed by Lambda, so uploads don't
+depend on the web server and large reports (up to 50 MB) never pass through it.
+
+```
+Action ─POST /uploads─▶ API Lambda ─▶ presigned S3 upload        (no VPC, never touches the DB)
+Action ─report─▶ S3 reports/ ─▶ SQS ─▶ processor Lambda ─▶ RDS    (in the VPC, no internet)
+Action ─GET /uploads/{id}─▶ API Lambda ─▶ result (score, counts)  (polls up to 2 minutes)
+```
+
+- The stack is [serverless/template.yaml](serverless/template.yaml): an S3 bucket (private,
+  encrypted, files kept 90 days), an SQS queue with a dead-letter queue (3 attempts), two Lambda
+  functions, an HTTP API, an S3 gateway endpoint (free) and a security group rule that lets the
+  processor reach RDS.
+- The processor has no internet access, so it doesn't fetch CVE intel. The web server checks
+  every 10 minutes for CVEs without intel (`RISK_RUNNER_PENDING_ENRICHMENT_MINUTES`) and
+  enriches them. No NAT gateway (about $33 a month) is needed.
+- At most two reports are processed at once, and reports for the same repository wait for each
+  other (a database lock), so lifecycle changes don't conflict.
+- The web server's `POST /api/v1/ingest` keeps working. Repos can move over one at a time.
+
+Requires the RDS database from step 5a, named `risk-runner`.
+
+### 1. Deploy the stack from CloudShell
+In CloudShell (check the region selector):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh && source ~/.local/bin/env
+```
+
+```bash
+git clone https://github.com/GITHUB_OWNER/Risk-Runner.git ~/Risk-Runner
+```
+
+```bash
+cd ~/Risk-Runner && AWS_REGION=REGION ./deploy/aws/serverless/deploy.sh
+```
+
+The script reads `RISK_RUNNER_DATABASE_URL` and `RISK_RUNNER_INGEST_TOKEN` from Parameter Store,
+finds the VPC, subnets and security group from the RDS instance, builds the Lambda package and
+deploys the `risk-runner-ingest` stack. The first deploy takes about 5 minutes. It ends with:
+
+```
+Deployed. Ingest URL: https://abc123.execute-api.REGION.amazonaws.com
+```
+
+To deploy an update, `git pull` and rerun the last command. If you change the ingest token or
+the database URL, rerun it too: the functions get both values at deploy time.
+
+### 2. Deploy it automatically on every push (optional)
+1. Add a second inline policy to the deploy role (`RiskRunnerGitHubDeploy`): paste
+   [serverless/deploy-role-policy.json](serverless/deploy-role-policy.json) with `REGION` and
+   `ACCOUNT_ID` filled in. It allows only resources named `risk-runner-ingest-*` and
+   `risk-runner-artifacts-*`, except for VPC security groups and endpoints, which can't be
+   limited by name.
+2. `gh variable set SERVERLESS_INGEST --body true`
+
+**Deploy to AWS** then runs a `deploy-ingest` job next to the server deploy.
+
+### 3. Point scanned repositories at it
+In each scanned repository, add the secret and the `ingest-url` input:
+
+```bash
+gh secret set RISK_RUNNER_INGEST_URL --repo OWNER/REPO --body https://abc123.execute-api.REGION.amazonaws.com
+```
+
+```yaml
+- name: Upload to Risk Runner
+  if: always()
+  uses: GITHUB_OWNER/Risk-Runner/action@main
+  with:
+    ingest-url: ${{ secrets.RISK_RUNNER_INGEST_URL }}
+    token: ${{ secrets.RISK_RUNNER_TOKEN }}
+    report: trivy.json
+```
+
+When `ingest-url` is set, `server-url` isn't needed. The step log looks the same as before. If
+processing takes longer than `wait-seconds` (default 120), the step reports the upload as queued
+and the results appear on the dashboard when they're done.
+
+### 4. Check it
+- The upload step logs `Risk Runner: … Repository risk score: …` and the dashboard shows the scan.
+- Logs: CloudWatch → Log groups → `/aws/lambda/risk-runner-ingest-api` and `…-processor`.
+- Failed messages: SQS → `risk-runner-ingest-dlq` → Send and receive messages → Poll. It should be empty.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `deploy.sh`: *"Missing parameter /risk-runner/…"* | Run step 5b for that parameter, in this region. |
+| `deploy.sh`: *"DBInstanceNotFound"* | The database isn't named `risk-runner`, or it's in another region. Set `DB_INSTANCE_ID=<name>` before the command. |
+| `deploy.sh`: *"uv: command not found"* | Run the uv install line, or `source ~/.local/bin/env` in a new CloudShell session. |
+| Stack fails on `S3GatewayEndpoint`: *"route table … already has a route with destination-prefix-list-id"* | The VPC already has an S3 gateway endpoint for some route tables. Add those route tables to it instead (VPC → Endpoints), then rerun. |
+| Upload warning: *"ingest endpoint rejected the upload: {"detail":"Invalid or missing bearer token"}"* | `RISK_RUNNER_TOKEN` doesn't match the token the stack was deployed with. If you rotated it, rerun `deploy.sh`. |
+| Upload stays *queued*; processor log shows a timeout connecting to RDS | The processor's security group rule is missing. Rerun `deploy.sh`. If the database has several security groups, check that the first one listed in RDS is attached to it. |
+| Upload stays *queued*; processor log is empty | Check the queue (messages in flight or in the DLQ) and that the bucket's event notification points at the queue (S3 → bucket → Properties → Event notifications). |
+| Upload warning: *"report was rejected: …"* | The report isn't a supported format. Same causes as a 422 from the web server. |
+| CVEs show no EPSS/KEV for a while | Expected for up to 10 minutes after a Lambda ingest. Check the web server's log for *"Enriching N new CVEs"*. |
+
+## I. Moving an existing deployment to RDS and Lambda
+
+For a server set up with the older guide (Postgres in a container on the instance). The old
+database volume stays on the instance, untouched, until you delete it, so you can roll back.
+
+### Try it from a branch before merging
+Until this change is on `main`, deploy it from its branch by hand. The automatic deploy only
+runs for `main` (the OIDC trust policy allows only `main`), so:
+
+1. **Disable automatic deploys while you test.** GitHub → Risk-Runner → Actions → **Deploy to
+   AWS** → **⋯** → **Disable workflow**. Otherwise a push to `main` puts the old version back on
+   the server.
+2. Follow steps 1–6 below, using `feat/serverless-ingest` wherever a branch is named.
+3. In the scanned repository you test with, use `GITHUB_OWNER/Risk-Runner/action@feat/serverless-ingest`
+   (the `ingest-url` input doesn't exist on `main` yet).
+4. When you're happy, merge the branch, change test repos back to `action@main`, and re-enable the workflow.
+
+### 1. Create the database
+Do [step 5a](#5a-create-the-rds-database). Choose **Connect to an EC2 compute resource** with your
+existing instance. Then store the URL (in the same CloudShell session):
+
+```bash
+aws ssm put-parameter --region REGION --type SecureString --overwrite --name /risk-runner/RISK_RUNNER_DATABASE_URL \
+  --value "postgresql+psycopg://risk:$DB_PASSWORD@DB_ENDPOINT:5432/risk_runner?sslmode=require"
+```
+
+Keep the `POSTGRES_PASSWORD` parameter for now. Rolling back needs it.
+
+### 2. Copy the data
+On the instance (Session Manager, then `sudo -iu ubuntu`), while the old version is still
+running. Run these one at a time.
+
+Dump the old database:
+
+```bash
+cd ~/Risk-Runner && docker compose -f docker-compose.aws.yml exec -T db pg_dump -U risk -d risk_runner -Fc > ~/risk_runner.dump && ls -lh ~/risk_runner.dump
+```
+
+Load it into RDS (before the new version starts, so the tables don't exist yet):
+
+```bash
+PGURL=$(aws ssm get-parameter --region REGION --with-decryption --name /risk-runner/RISK_RUNNER_DATABASE_URL --query Parameter.Value --output text | sed 's/+psycopg//')
+```
+
+```bash
+docker run --rm -i postgres:17 pg_restore --no-owner --no-privileges -d "$PGURL" < ~/risk_runner.dump
+```
+
+No output means it worked. Scans uploaded between the dump and step 3 aren't copied; rerun those
+scans afterwards.
+
+### 3. Deploy the new version of the server
+
+```bash
+cd ~/Risk-Runner && git fetch origin && git checkout feat/serverless-ingest && AWS_REGION=REGION ./deploy/deploy.sh
+```
+
+(After merging, use `git checkout main && git pull` instead.) The old `db` container is removed;
+its volume (`risk-runner_pgdata`) is kept. Open the dashboard: the repositories, findings,
+triage decisions and business context should all be there.
+
+To look inside the RDS database: `docker run --rm -it postgres:17 psql "$PGURL"`, then for
+example `select count(*) from findings;`.
+
+### 4. Deploy serverless ingestion (optional)
+Follow [part H](#h-serverless-ingestion-lambda), step 1. When trying the branch, clone it in CloudShell:
+
+```bash
+git clone -b feat/serverless-ingest https://github.com/GITHUB_OWNER/Risk-Runner.git ~/Risk-Runner
+```
+
+Then point one test repository at it (part H, step 3, with `action@feat/serverless-ingest`),
+push to its default branch and check the upload step and the dashboard.
+
+### 5. Roll back if something is wrong
+On the instance:
+
+```bash
+cd ~/Risk-Runner && git checkout main && AWS_REGION=REGION ./deploy/deploy.sh
+```
+
+This starts the old Postgres container again on its untouched volume. Anything uploaded while
+running on RDS isn't in it; rerun those scans. Change test repos back to `action@main` and
+`server-url`. The RDS database and the `risk-runner-ingest` stack can stay (they cost money) or
+be deleted (see part G).
+
+### 6. Clean up once you're sure
+After a week or two on RDS:
+
+```bash
+docker volume rm risk-runner_pgdata && rm ~/risk_runner.dump
+```
+
+```bash
+aws ssm delete-parameter --region REGION --name /risk-runner/POSTGRES_PASSWORD
+```
+
+Optionally move the instance to a smaller type (part G).

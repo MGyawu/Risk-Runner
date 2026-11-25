@@ -1,0 +1,123 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DeployIngestStack",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:GetTemplateSummary"
+      ],
+      "Resource": [
+        "arn:aws:cloudformation:REGION:ACCOUNT_ID:stack/risk-runner-ingest/*",
+        "arn:aws:cloudformation:REGION:aws:transform/Serverless-2016-10-31"
+      ]
+    },
+    {
+      "Sid": "ReadDeployConfig",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/risk-runner/*"
+    },
+    {
+      "Sid": "Buckets",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::risk-runner-artifacts-ACCOUNT_ID-REGION",
+        "arn:aws:s3:::risk-runner-artifacts-ACCOUNT_ID-REGION/*",
+        "arn:aws:s3:::risk-runner-ingest-reports-ACCOUNT_ID-REGION",
+        "arn:aws:s3:::risk-runner-ingest-reports-ACCOUNT_ID-REGION/*"
+      ]
+    },
+    {
+      "Sid": "Queues",
+      "Effect": "Allow",
+      "Action": "sqs:*",
+      "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:risk-runner-ingest-*"
+    },
+    {
+      "Sid": "Functions",
+      "Effect": "Allow",
+      "Action": "lambda:*",
+      "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:risk-runner-ingest-*"
+    },
+    {
+      "Sid": "EventSourceMappings",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateEventSourceMapping",
+        "lambda:GetEventSourceMapping",
+        "lambda:UpdateEventSourceMapping",
+        "lambda:DeleteEventSourceMapping",
+        "lambda:ListEventSourceMappings"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "FunctionRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/risk-runner-ingest-*"
+    },
+    {
+      "Sid": "PassFunctionRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/risk-runner-ingest-*",
+      "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}
+    },
+    {
+      "Sid": "HttpApi",
+      "Effect": "Allow",
+      "Action": ["apigateway:GET", "apigateway:POST", "apigateway:PUT", "apigateway:PATCH", "apigateway:DELETE", "apigateway:TagResource"],
+      "Resource": ["arn:aws:apigateway:REGION::/apis", "arn:aws:apigateway:REGION::/apis/*", "arn:aws:apigateway:REGION::/tags/*"]
+    },
+    {
+      "Sid": "LogGroups",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy", "logs:TagResource", "logs:TagLogGroup"],
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/lambda/risk-runner-ingest-*"
+    },
+    {
+      "Sid": "DescribeForDeploy",
+      "Effect": "Allow",
+      "Action": ["logs:DescribeLogGroups", "rds:DescribeDBInstances", "ec2:Describe*"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NetworkingInTheVpc",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:CreateTags",
+        "ec2:CreateVpcEndpoint",
+        "ec2:ModifyVpcEndpoint",
+        "ec2:DeleteVpcEndpoints"
+      ],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"aws:RequestedRegion": "REGION"}}
+    }
+  ]
+}

@@ -5,8 +5,20 @@ branding:
   color: orange
 inputs:
   server-url:
-    description: Base URL of your Risk Runner server, e.g. https://risk-runner.example.com
-    required: true
+    description: Base URL of your Risk Runner server, e.g. https://risk-runner.example.com. Used when ingest-url is empty.
+    required: false
+    default: ""
+  ingest-url:
+    description: >-
+      Serverless ingest endpoint (the IngestUrl output of deploy/aws/serverless), e.g.
+      https://abc123.execute-api.us-east-2.amazonaws.com. When set, the report goes to S3 and is
+      processed by Lambda instead of being sent to server-url.
+    required: false
+    default: ""
+  wait-seconds:
+    description: With ingest-url, how long to wait for processing before reporting the upload as queued.
+    required: false
+    default: "120"
   token:
     description: Ingest token (RISK_RUNNER_INGEST_TOKEN on the server). Store it as a repository or org secret.
     required: true
@@ -44,6 +56,8 @@ runs:
       shell: bash
       env:
         RR_URL: ${{ inputs.server-url }}
+        RR_INGEST_URL: ${{ inputs.ingest-url }}
+        RR_WAIT: ${{ inputs.wait-seconds }}
         RR_TOKEN: ${{ inputs.token }}
         RR_REPORT: ${{ inputs.report }}
         RR_SCAN_TYPE: ${{ inputs.scan-type }}
@@ -60,20 +74,66 @@ runs:
         fail() { echo "::warning::Risk Runner upload: $1"; [ "$RR_FAIL" = "true" ] && exit 1 || exit 0; }
         [ -f "$RR_REPORT" ] || fail "report not found at $RR_REPORT"
 
-        args=(--silent --show-error --fail-with-body --retry 3
-              -H "Authorization: Bearer $RR_TOKEN"
-              -F "report=@$RR_REPORT;type=application/json"
-              --form-string "repository=$RR_REPO"
-              --form-string "branch=$RR_BRANCH"
-              --form-string "commit_sha=$RR_SHA"
-              --form-string "workflow_run_url=$RR_RUN_URL")
-        [ -n "$RR_SCAN_TYPE" ] && args+=(--form-string "scan_type=$RR_SCAN_TYPE")
-        [ -n "$RR_FORMAT" ] && args+=(--form-string "format=$RR_FORMAT")
-        [ -n "$RR_TOOL" ] && args+=(--form-string "tool=$RR_TOOL")
-        [ -n "$RR_DEFAULT_BRANCH" ] && args+=(--form-string "default_branch=$RR_DEFAULT_BRANCH")
+        jget() { python3 -c 'import json, sys; print(json.load(sys.stdin).get(sys.argv[1]) or "")' "$1"; }
+        auth=(-H "Authorization: Bearer $RR_TOKEN")
 
-        if ! body=$(curl "${args[@]}" "${RR_URL%/}/api/v1/ingest"); then
-          fail "server rejected the upload: $body"
+        if [ -n "$RR_INGEST_URL" ]; then
+          # Serverless: register the upload, send the report straight to S3, then wait for Lambda.
+          base="${RR_INGEST_URL%/}"
+          meta=$(python3 -c '
+        import json, os
+        env = {"repository": "RR_REPO", "branch": "RR_BRANCH", "commit_sha": "RR_SHA", "workflow_run_url": "RR_RUN_URL",
+               "scan_type": "RR_SCAN_TYPE", "format": "RR_FORMAT", "tool": "RR_TOOL", "default_branch": "RR_DEFAULT_BRANCH"}
+        print(json.dumps({k: os.environ[v] for k, v in env.items() if os.environ.get(v)}))')
+          if ! created=$(curl --silent --show-error --fail-with-body --retry 3 "${auth[@]}" \
+              -H "Content-Type: application/json" --data "$meta" "$base/uploads"); then
+            fail "ingest endpoint rejected the upload: $created"
+          fi
+          upload_id=$(printf '%s' "$created" | jget upload_id)
+          mapfile -t form < <(printf '%s' "$created" | python3 -c '
+        import json, sys
+        u = json.load(sys.stdin)["upload"]
+        print(u["url"])
+        for k, v in u["fields"].items():
+            print(f"{k}={v}")')
+          s3args=()
+          for field in "${form[@]:1}"; do s3args+=(--form-string "$field"); done
+          if ! out=$(curl --silent --show-error --fail-with-body --retry 3 "${s3args[@]}" \
+              -F "file=@$RR_REPORT;type=application/json" "${form[0]}"); then
+            fail "report upload to S3 failed: $out"
+          fi
+
+          status=pending
+          deadline=$((SECONDS + RR_WAIT))
+          while [ "$status" = pending ] && [ "$SECONDS" -lt "$deadline" ]; do
+            sleep 3
+            body=$(curl --silent --show-error --fail-with-body "${auth[@]}" "$base/uploads/$upload_id") || continue
+            status=$(printf '%s' "$body" | jget status)
+          done
+          case "$status" in
+            done) ;;
+            failed) fail "report was rejected: $(printf '%s' "$body" | jget error)" ;;
+            *)
+              echo "Risk Runner: upload $upload_id is queued and still processing. Results will appear on the dashboard."
+              echo "### Risk Runner: upload queued (still processing)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0 ;;
+          esac
+        else
+          [ -n "$RR_URL" ] || fail "set server-url or ingest-url"
+          args=(--silent --show-error --fail-with-body --retry 3 "${auth[@]}"
+                -F "report=@$RR_REPORT;type=application/json"
+                --form-string "repository=$RR_REPO"
+                --form-string "branch=$RR_BRANCH"
+                --form-string "commit_sha=$RR_SHA"
+                --form-string "workflow_run_url=$RR_RUN_URL")
+          [ -n "$RR_SCAN_TYPE" ] && args+=(--form-string "scan_type=$RR_SCAN_TYPE")
+          [ -n "$RR_FORMAT" ] && args+=(--form-string "format=$RR_FORMAT")
+          [ -n "$RR_TOOL" ] && args+=(--form-string "tool=$RR_TOOL")
+          [ -n "$RR_DEFAULT_BRANCH" ] && args+=(--form-string "default_branch=$RR_DEFAULT_BRANCH")
+
+          if ! body=$(curl "${args[@]}" "${RR_URL%/}/api/v1/ingest"); then
+            fail "server rejected the upload: $body"
+          fi
         fi
         read -r score summary < <(printf '%s' "$body" | python3 -c '
         import json, sys

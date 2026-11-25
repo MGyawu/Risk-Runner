@@ -15,7 +15,7 @@ aws ssm get-parameters-by-path --path "$PREFIX" --recursive --with-decryption \
     printf '%s=%s\n' "${name##*/}" "$value"
   done > .env.new
 
-for key in DOMAIN POSTGRES_PASSWORD RISK_RUNNER_INGEST_TOKEN RISK_RUNNER_API_TOKEN; do
+for key in DOMAIN RISK_RUNNER_DATABASE_URL RISK_RUNNER_INGEST_TOKEN RISK_RUNNER_API_TOKEN; do
   if ! grep -q "^$key=." .env.new; then
     echo "Missing parameter $PREFIX/$key" >&2
     rm -f .env.new

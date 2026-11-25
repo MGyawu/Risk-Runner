@@ -1,6 +1,7 @@
 # Production-style stack for a single server (e.g. AWS EC2):
-#   Caddy (HTTPS, automatic Let's Encrypt cert) -> Risk Runner -> Postgres
-# Only ports 80/443 are published; the app and database stay on the private Docker network.
+#   Caddy (HTTPS, automatic Let's Encrypt cert) -> Risk Runner -> Amazon RDS (PostgreSQL)
+# Only ports 80/443 are published. The database is RDS, reached through RISK_RUNNER_DATABASE_URL
+# in .env (deploy/deploy.sh writes it from Parameter Store).
 # Usage: docker compose -f docker-compose.aws.yml up -d --build
 services:
   caddy:
@@ -22,26 +23,11 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      RISK_RUNNER_DATABASE_URL: postgresql+psycopg://risk:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/risk_runner
+      RISK_RUNNER_DATABASE_URL: ${RISK_RUNNER_DATABASE_URL:?set RISK_RUNNER_DATABASE_URL in .env}
       RISK_RUNNER_CORS_ORIGINS: '["https://${DOMAIN}"]'
-    depends_on:
-      db:
-        condition: service_healthy
-
-  db:
-    image: postgres:17
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: risk
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: risk_runner
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U risk -d risk_runner"]
-      interval: 5s
-      retries: 10
 
 volumes:
+  # Data of the old Postgres container. Nothing uses it now, but it's kept so the data stays
+  # available for migration or rollback. Remove it with `docker volume rm risk-runner_pgdata`.
   pgdata:
   caddy_data:

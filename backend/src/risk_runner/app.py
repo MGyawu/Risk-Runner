@@ -56,18 +56,45 @@ def enrich_and_rescore(cves: list[str] | None = None) -> None:
         rescore_all(session)
 
 
+def enrich_pending() -> None:
+    """Enrich CVEs that have no intel yet (reports ingested by Lambda, which has no internet access)."""
+    with SessionLocal() as session:
+        cves = list(
+            session.scalars(
+                select(func.upper(Finding.cve))
+                .outerjoin(CveIntel, CveIntel.cve == func.upper(Finding.cve))
+                .where(Finding.cve.is_not(None), CveIntel.cve.is_(None))
+                .distinct()
+            )
+        )
+    if cves:
+        log.info("Enriching %d new CVEs", len(cves))
+        enrich_and_rescore(cves)
+
+
 async def _periodic_enrichment() -> None:
     while True:
         await asyncio.sleep(settings.enrichment_interval_hours * 3600)
         await run_in_threadpool(enrich_and_rescore)
 
 
+async def _pending_enrichment() -> None:
+    while True:
+        await asyncio.sleep(settings.pending_enrichment_minutes * 60)
+        try:
+            await run_in_threadpool(enrich_pending)
+        except Exception:
+            log.exception("Pending enrichment failed")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    task = asyncio.create_task(_periodic_enrichment()) if settings.enrichment_enabled else None
+    tasks = []
+    if settings.enrichment_enabled:
+        tasks = [asyncio.create_task(_periodic_enrichment()), asyncio.create_task(_pending_enrichment())]
     yield
-    if task:
+    for task in tasks:
         task.cancel()
 
 
