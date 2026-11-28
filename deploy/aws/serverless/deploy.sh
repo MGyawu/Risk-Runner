@@ -85,3 +85,15 @@ if [ "$code" != 401 ]; then
   exit 1
 fi
 echo "Deployed. Ingest URL: $URL"
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  {
+    echo "### Serverless ingest deployed"
+    echo "Ingest URL: \`$URL\`"
+    echo
+    echo "Point a scanned repository at it, then use \`ingest-url: \${{ secrets.RISK_RUNNER_INGEST_URL }}\` in its upload step:"
+    echo
+    echo '```bash'
+    echo "gh secret set RISK_RUNNER_INGEST_URL --repo OWNER/REPO --body $URL"
+    echo '```'
+  } >> "$GITHUB_STEP_SUMMARY"
+fi

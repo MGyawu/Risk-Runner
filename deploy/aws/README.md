@@ -46,7 +46,6 @@ Replace these everywhere they appear, in commands and in the JSON policy files:
 | `GITHUB_OWNER` | your GitHub user or org | Your repository URL |
 | `OWNER_ID`, `REPO_ID` | numeric GitHub IDs | See step 9 |
 | `INSTANCE_ID` | `i-0abc…` | EC2 → Instances (after step 3) |
-| `DB_ENDPOINT` | `risk-runner.abc123.us-east-2.rds.amazonaws.com` | RDS → Databases → risk-runner → Connectivity (after step 5a) |
 | `YOUR_DOMAIN` | `riskrunner.example.com` | Chosen in step 4 |
 
 Before running a command or saving a policy, check that no placeholder is left in it. A
@@ -110,11 +109,12 @@ for them as you go. [F. Troubleshooting](#f-troubleshooting) has the fix for eac
 **Secrets and the server**
 - **Generated secrets change every time you run the commands.** Rerunning the step 5b block
   creates new tokens. Rerun only the line you mean to change.
-- **The database URL holds the RDS password.** Changing the password in RDS without updating
-  `RISK_RUNNER_DATABASE_URL` (or the reverse) locks the app out. Change both, then redeploy the
-  server and, if you use it, the serverless stack.
-- **Use a self-managed RDS password.** If RDS manages the password in Secrets Manager, it rotates
-  it and the stored URL stops working.
+- **Let the scripts own the database settings.** `RDS_MASTER_PASSWORD` and
+  `RISK_RUNNER_DATABASE_URL` are written by `deploy/aws/database/deploy.sh`. Changing the password
+  in the RDS console, or editing the URL by hand, locks the app out. To change the password, `put`
+  a new `RDS_MASTER_PASSWORD` and run the workflow.
+- **Don't create the database in the RDS console.** The workflow creates `risk-runner` as a
+  CloudFormation stack and fails if a database with that name already exists.
 - **Parameters are read only at deploy time.** After changing one, redeploy.
 - **Run server commands on the server.** Steps 6–7 run in Session Manager on the instance (the
   prompt shows `ubuntu@ip-…`), not in CloudShell. Paste one command at a time; two commands run
@@ -201,36 +201,30 @@ It doesn't test your hostname.
 ### 5. Create the database and store the secrets
 
 #### 5a. Create the RDS database
-First generate the database password in CloudShell (check the region selector) and keep it for
-step 5b. Hex characters only, so it's safe inside a URL:
+In CloudShell (check the region selector). This is the same script the Deploy to AWS workflow
+runs, so later deploys keep it up to date:
 
 ```bash
-DB_PASSWORD=$(openssl rand -hex 24); echo "$DB_PASSWORD"
+git clone https://github.com/GITHUB_OWNER/Risk-Runner.git ~/Risk-Runner
 ```
 
-Then RDS → Databases → **Create database**, in the same region as the instance:
-- **Creation method:** Standard create (called *Full configuration* in newer consoles). **Engine:** PostgreSQL, version 17.
-- **Template:** Free tier if it's offered, otherwise Dev/Test. Choose **Single-AZ** if asked.
-- **DB instance identifier:** `risk-runner`. The serverless deploy script looks the database up by this name.
-- **Master username:** `risk`. **Credentials management: Self managed**, and paste `$DB_PASSWORD`.
-  Don't choose *Managed in AWS Secrets Manager* (see [Lessons learned](#lessons-learned-things-to-watch-out-for)).
-- **Instance class:** Burstable → **db.t4g.micro**. **Storage:** gp3, 20 GiB. Under storage
-  autoscaling, a maximum of 50 GiB is plenty.
-- **Connectivity:** choose **Connect to an EC2 compute resource** and pick your instance. This
-  puts the database in the instance's VPC and creates the security groups that let only the
-  instance reach port 5432. **Public access: No.**
-- **Additional configuration:** **Initial database name** `risk_runner` (without it, no database
-  is created). Backup retention 7 days, encryption on, **Enable deletion protection** on.
-- Create. It takes about 10 minutes. Then copy the **endpoint** from the Connectivity & security tab.
+```bash
+cd ~/Risk-Runner && AWS_REGION=REGION INSTANCE_ID=INSTANCE_ID ./deploy/aws/database/deploy.sh
+```
+
+It takes about 10 minutes and ends with `Database ready at …`. It creates the `risk-runner-db`
+CloudFormation stack: a db.t4g.micro PostgreSQL 17 database named `risk-runner` in the
+instance's VPC, reachable only from the instance's security group, encrypted, with 7-day
+backups and deletion protection. It also generates the password and stores
+`/risk-runner/RDS_MASTER_PASSWORD` and `/risk-runner/RISK_RUNNER_DATABASE_URL`.
 
 #### 5b. Store the secrets in Parameter Store
-In the same CloudShell session (so `$DB_PASSWORD` is still set):
+In CloudShell:
 
 ```bash
 REGION=REGION   # your region, e.g. us-east-2
 put() { aws ssm put-parameter --region "$REGION" --type SecureString --overwrite --name "/risk-runner/$1" --value "$2"; }
 put DOMAIN YOUR_DOMAIN
-put RISK_RUNNER_DATABASE_URL "postgresql+psycopg://risk:$DB_PASSWORD@DB_ENDPOINT:5432/risk_runner?sslmode=require"
 put RISK_RUNNER_INGEST_TOKEN "$(openssl rand -hex 32)"
 put RISK_RUNNER_API_TOKEN "$(openssl rand -hex 32)"
 # Optional: Claude analysis
@@ -243,14 +237,13 @@ put RISK_RUNNER_API_TOKEN "$(openssl rand -hex 32)"
   `aws ssm get-parameter --region "$REGION" --with-decryption --name /risk-runner/<NAME> --query Parameter.Value --output text`.
 - **`DOMAIN` must be your real hostname from step 4.** If it's wrong, Caddy requests a
   certificate for a host that isn't your server and HTTPS fails.
-- **Replace `DB_ENDPOINT`** with the endpoint from step 5a. A wrong host shows up as the app
-  failing its health check during the first deploy.
 - **Don't rerun the whole block later.** It creates new tokens that scanned repos and the
   dashboard don't know about. To change a single value, run just its `put` line.
 - Every `/risk-runner/<NAME>` parameter becomes `NAME=value` in the server's `.env`, so any
   `RISK_RUNNER_*` setting can be added the same way. Avoid `$` in values (Docker Compose expands it).
 - Check what's stored: `aws ssm get-parameters-by-path --region "$REGION" --path /risk-runner --query 'Parameters[].Name'`.
-  This should list at least `DOMAIN`, `RISK_RUNNER_DATABASE_URL`, `RISK_RUNNER_INGEST_TOKEN` and `RISK_RUNNER_API_TOKEN`.
+  This should list at least `DOMAIN`, `RDS_MASTER_PASSWORD`, `RISK_RUNNER_DATABASE_URL`,
+  `RISK_RUNNER_INGEST_TOKEN` and `RISK_RUNNER_API_TOKEN`.
 
 ### 6. Clone the repo on the server
 Connect with EC2 → the instance → **Connect → Session Manager → Connect**. This opens a shell on
@@ -320,10 +313,17 @@ permissions and create the role as `RiskRunnerGitHubDeploy`. Then:
   `repo:owner/repo:ref:…` or `repo:owner@OWNER_ID/repo@REPO_ID:ref:…`. Both are exact
   matches, so only workflows on `main` of your Risk-Runner repo can assume the role. Don't
   loosen it with wildcards such as `GITHUB_OWNER*`, which would also match other accounts.
-- **Add permissions → Create inline policy → JSON:** paste [deploy-role-policy.json](deploy-role-policy.json)
-  with `REGION`, `ACCOUNT_ID` and **`INSTANCE_ID`** filled in. It can only send commands to this
-  one instance. To check what was saved:
-  `aws iam get-role-policy --role-name RiskRunnerGitHubDeploy --policy-name <policy name> --query PolicyDocument`.
+- **Permissions:** in CloudShell, run
+  ```bash
+  cd ~/Risk-Runner && AWS_REGION=REGION INSTANCE_ID=INSTANCE_ID GITHUB_OWNER=GITHUB_OWNER ./deploy/aws/bootstrap-permissions.sh
+  ```
+  It fills in the IDs itself, rewrites the trust policy (only `main` of your repo) and attaches
+  three inline policies: SSM commands to this one instance
+  ([deploy-role-policy.json](deploy-role-policy.json)), the database stack
+  ([database/deploy-role-policy.json](database/deploy-role-policy.json)) and the serverless stack
+  ([serverless/deploy-role-policy.json](serverless/deploy-role-policy.json)). Rerun it whenever
+  those files change. To check what was saved:
+  `aws iam get-role-policy --role-name RiskRunnerGitHubDeploy --policy-name RiskRunnerDeploySsm --query PolicyDocument`.
 
 Copy the role ARN from the top of the role's page.
 
@@ -343,7 +343,9 @@ Enter plain values, with no `https://`, quotes or trailing spaces. `DOMAIN` must
 
 ## B. Deploying
 
-- Push to `main`. **CI** runs the tests, then **Deploy to AWS** deploys that exact commit and runs a health check.
+- Push to `main`. **CI** runs the tests, then **Deploy to AWS** updates the database stack,
+  deploys that exact commit to the server (with a health check) and deploys the serverless
+  ingest stack. Each job does nothing when there's nothing to change.
 - To redeploy without a code change, go to Actions → Deploy to AWS → **Run workflow** on `main`.
   The server reads Parameter Store only during a deploy, so redeploy after changing any parameter.
 - The server's output appears in the "Server output" group of the *Deploy through SSM Run Command* step.
@@ -351,8 +353,8 @@ Enter plain values, with no `https://`, quotes or trailing spaces. `DOMAIN` must
   uses it (`RISK_RUNNER_TOKEN` secrets in scanned repos, the dashboard's Token button). If you
   use serverless ingestion, redeploy that stack too ([part H](#h-serverless-ingestion-lambda)),
   since the Lambda gets the token at deploy time.
-- To change the database password: RDS → Modify → new master password, then `put` the new
-  `RISK_RUNNER_DATABASE_URL`, then redeploy the server (and the serverless stack).
+- To change the database password: `put RDS_MASTER_PASSWORD "$(openssl rand -hex 24)"`, then run
+  the workflow. The `database` job changes it in RDS and updates the URL; the later jobs pick it up.
 
 Open `https://YOUR_DOMAIN`, click **Token** (top right), and paste the `RISK_RUNNER_API_TOKEN`
 value. Until you do, the dashboard stays empty, because the read API requires the token.
@@ -516,9 +518,11 @@ inside the GitHub runner and scans `localhost`.
 | `git clone` asks for a password | The URL is malformed (often two commands pasted together) or the repo is private. Ctrl+C, then see step 6. |
 | `deploy.sh`: *"Missing parameter /risk-runner/DOMAIN"* (or another name) | The parameters are in a different region, or that one wasn't saved. On the instance: `aws ssm get-parameters-by-path --region REGION --path /risk-runner --query 'Parameters[].Name'`. An empty list means a region mismatch: recreate the parameters in the right region and delete the others. |
 | `deploy.sh`: AccessDenied reading parameters | The instance role's inline policy has the wrong region or account ID, or a placeholder left in it. |
-| `deploy.sh`: *"Missing parameter /risk-runner/RISK_RUNNER_DATABASE_URL"* | Step 5b wasn't done for this parameter, or it's in another region. |
-| App unhealthy; its log (`docker compose -f docker-compose.aws.yml logs risk-runner --tail 80`) shows *"connection timed out"* to the RDS host | The database's security group doesn't allow the instance. RDS → the database → Actions → **Set up EC2 connection** → pick the instance. |
-| App log: *"password authentication failed"* or *"database "risk_runner" does not exist"* | The password in `RISK_RUNNER_DATABASE_URL` doesn't match RDS, or no initial database name was set in step 5a. Fix the URL, or create the database (part I, step 3 shows how to run `psql`), then redeploy. |
+| `deploy.sh`: *"Missing parameter /risk-runner/RISK_RUNNER_DATABASE_URL"* | The database hasn't been created in this region yet. Run step 5a, or the workflow's `database` job. |
+| `database` job: *"risk-runner already exists"* | A database with that name was created outside the stack (for example in the console). Delete or rename it, or import it into the stack, then rerun. |
+| `database` job: AccessDenied | The deploy role is missing the database policy. Rerun `bootstrap-permissions.sh`. |
+| App unhealthy; its log (`docker compose -f docker-compose.aws.yml logs risk-runner --tail 80`) shows *"connection timed out"* to the RDS host | The database allows the instance's **first** security group. If you changed the instance's security groups, rerun the workflow so the stack picks up the new one. |
+| App log: *"password authentication failed"* | The URL and the RDS password don't match, usually after a change in the RDS console. Rerun the workflow: the `database` job sets both from `RDS_MASTER_PASSWORD`. |
 | Deploy workflow: *"Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity"* | The trust policy doesn't match what GitHub sent. In the deploy region, open CloudTrail → Event history → Event name `AssumeRoleWithWebIdentity`. The event's `userIdentity.userName` is the exact `sub` GitHub sent; make the trust policy match it. Also check the provider ARN, the audience and the `AWS_DEPLOY_ROLE_ARN` variable. |
 | Deploy workflow: *"not authorized to perform: ssm:SendCommand … because no identity-based policy allows"* | The deploy role's inline policy still says `INSTANCE_ID` (or has the wrong region or account). Fill it in and save. |
 | Health check: *"TLS connect error … tlsv1 alert internal error"* | Caddy has no certificate yet. On the instance, run `docker compose -f docker-compose.aws.yml logs caddy --tail 100`. A *"Timeout during connect"* for a different hostname or IP means `/risk-runner/DOMAIN` is wrong: fix it and redeploy. A timeout for your own IP means ports 80/443 are blocked. *rateLimited* means a Let's Encrypt limit: switch to `….nip.io` (update the parameter and the variable, then redeploy). If the log shows the certificate is still being obtained, wait and rerun. |
@@ -575,9 +579,9 @@ Findings come back on the next scans; triage decisions and business context must
    reports bucket first if the delete stops on it.
 3. EC2 → the instance → Instance state → **Terminate**.
 4. EC2 → Elastic IPs → select it → Actions → **Release Elastic IP addresses**.
-5. RDS → the database → Modify → turn off deletion protection → Apply immediately. Then Actions
-   → **Delete**. Take a final snapshot if you might want the data back (snapshots cost about
-   $0.095 per GB-month).
+5. RDS → the database → Modify → turn off deletion protection → Apply immediately. Then
+   CloudFormation → `risk-runner-db` → **Delete**. A final snapshot is taken automatically (about
+   $0.095 per GB-month; delete it under RDS → Snapshots when you no longer need it).
 6. Keep the parameters, both IAM roles and the OIDC provider. They cost nothing and make
    rebuilding quick.
 
@@ -586,10 +590,10 @@ Findings come back on the next scans; triage decisions and business context must
 2. The IP is new, so update the hostname. With your own domain, point the A record at the new
    IP. With sslip.io or nip.io, the hostname changes: update the `/risk-runner/DOMAIN` parameter
    and the `DOMAIN` variable, and `RISK_RUNNER_URL` in scanned repositories.
-3. Step 5a: create the database again (or restore the final snapshot with the identifier
-   `risk-runner`, then **Set up EC2 connection** to the new instance). Update
-   `RISK_RUNNER_DATABASE_URL` with the new endpoint and password.
-4. Update `INSTANCE_ID` in the deploy role's inline policy and the `EC2_INSTANCE_ID` variable.
+3. Step 5a: create the database again. To get the old data back, restore the final snapshot
+   into it afterwards (RDS → Snapshots → Restore creates a separate database; copy the data over
+   with `pg_dump`/`pg_restore` as in `deploy/aws/migrate-to-rds.sh`).
+4. Update the `EC2_INSTANCE_ID` variable and rerun `bootstrap-permissions.sh` with the new `INSTANCE_ID`.
 5. Steps 6–7: clone and deploy by hand. Redeploy the serverless stack if you use it.
 6. Re-enable the **Deploy to AWS** workflow. The tokens are unchanged, so the scanned
    repositories' `RISK_RUNNER_TOKEN` and your dashboard Token still work.
@@ -630,41 +634,29 @@ Action ─GET /uploads/{id}─▶ API Lambda ─▶ result (score, counts)  (pol
 
 Requires the RDS database from step 5a, named `risk-runner`.
 
-### 1. Deploy the stack from CloudShell
-In CloudShell (check the region selector):
+### 1. Deploy it
+The **Deploy to AWS** workflow deploys the stack on every run (the `deploy-ingest` job). Its
+summary page shows the ingest URL and the `gh secret set` command for step 3. To skip it, set
+`gh variable set SERVERLESS_INGEST --body false`.
+
+The script reads `RISK_RUNNER_DATABASE_URL` and `RISK_RUNNER_INGEST_TOKEN` from Parameter Store,
+finds the VPC, subnets and security group from the RDS instance, builds the Lambda package and
+deploys the `risk-runner-ingest` stack. The first deploy takes about 5 minutes. If you change the
+ingest token or the database URL, run the workflow again: the functions get both values at
+deploy time.
+
+### 2. Deploying it by hand (optional)
+From CloudShell, with the repo cloned as in step 5a:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh && source ~/.local/bin/env
 ```
 
 ```bash
-git clone https://github.com/GITHUB_OWNER/Risk-Runner.git ~/Risk-Runner
+cd ~/Risk-Runner && git pull && AWS_REGION=REGION ./deploy/aws/serverless/deploy.sh
 ```
 
-```bash
-cd ~/Risk-Runner && AWS_REGION=REGION ./deploy/aws/serverless/deploy.sh
-```
-
-The script reads `RISK_RUNNER_DATABASE_URL` and `RISK_RUNNER_INGEST_TOKEN` from Parameter Store,
-finds the VPC, subnets and security group from the RDS instance, builds the Lambda package and
-deploys the `risk-runner-ingest` stack. The first deploy takes about 5 minutes. It ends with:
-
-```
-Deployed. Ingest URL: https://abc123.execute-api.REGION.amazonaws.com
-```
-
-To deploy an update, `git pull` and rerun the last command. If you change the ingest token or
-the database URL, rerun it too: the functions get both values at deploy time.
-
-### 2. Deploy it automatically on every push (optional)
-1. Add a second inline policy to the deploy role (`RiskRunnerGitHubDeploy`): paste
-   [serverless/deploy-role-policy.json](serverless/deploy-role-policy.json) with `REGION` and
-   `ACCOUNT_ID` filled in. It allows only resources named `risk-runner-ingest-*` and
-   `risk-runner-artifacts-*`, except for VPC security groups and endpoints, which can't be
-   limited by name.
-2. `gh variable set SERVERLESS_INGEST --body true`
-
-**Deploy to AWS** then runs a `deploy-ingest` job next to the server deploy.
+It ends with `Deployed. Ingest URL: https://abc123.execute-api.REGION.amazonaws.com`.
 
 ### 3. Point scanned repositories at it
 In each scanned repository, add the secret and the `ingest-url` input:
@@ -708,95 +700,96 @@ and the results appear on the dashboard when they're done.
 
 ## I. Moving an existing deployment to RDS and Lambda
 
-For a server set up with the older guide (Postgres in a container on the instance). The old
-database volume stays on the instance, untouched, until you delete it, so you can roll back.
+For a server set up with the older guide (Postgres in a container on the instance). The workflow
+does the move: it creates the database, copies the data, deploys the new server and the
+serverless stack. The old database volume stays on the instance, untouched, so you can roll back.
 
-### Try it from a branch before merging
-Until this change is on `main`, deploy it from its branch by hand. The automatic deploy only
-runs for `main` (the OIDC trust policy allows only `main`), so:
-
-1. **Disable automatic deploys while you test.** GitHub → Risk-Runner → Actions → **Deploy to
-   AWS** → **⋯** → **Disable workflow**. Otherwise a push to `main` puts the old version back on
-   the server.
-2. Follow steps 1–6 below, using `feat/serverless-ingest` wherever a branch is named.
-3. In the scanned repository you test with, use `GITHUB_OWNER/Risk-Runner/action@feat/serverless-ingest`
-   (the `ingest-url` input doesn't exist on `main` yet).
-4. When you're happy, merge the branch, change test repos back to `action@main`, and re-enable the workflow.
-
-### 1. Create the database
-Do [step 5a](#5a-create-the-rds-database). Choose **Connect to an EC2 compute resource** with your
-existing instance. Then store the URL (in the same CloudShell session):
+### 1. Allow the workflow to do it (once, in CloudShell)
+The role from step 9 can only send commands to the instance. Give it the new permissions and
+let it deploy from the branch you're trying. Leave `BRANCH=…` out once the change is merged.
 
 ```bash
-aws ssm put-parameter --region REGION --type SecureString --overwrite --name /risk-runner/RISK_RUNNER_DATABASE_URL \
-  --value "postgresql+psycopg://risk:$DB_PASSWORD@DB_ENDPOINT:5432/risk_runner?sslmode=require"
+git clone -b feat/serverless-ingest https://github.com/GITHUB_OWNER/Risk-Runner.git ~/Risk-Runner-next
 ```
-
-Keep the `POSTGRES_PASSWORD` parameter for now. Rolling back needs it.
-
-### 2. Copy the data
-On the instance (Session Manager, then `sudo -iu ubuntu`), while the old version is still
-running. Run these one at a time.
-
-Dump the old database:
 
 ```bash
-cd ~/Risk-Runner && docker compose -f docker-compose.aws.yml exec -T db pg_dump -U risk -d risk_runner -Fc > ~/risk_runner.dump && ls -lh ~/risk_runner.dump
+cd ~/Risk-Runner-next && AWS_REGION=REGION INSTANCE_ID=INSTANCE_ID GITHUB_OWNER=GITHUB_OWNER BRANCH=feat/serverless-ingest ./deploy/aws/bootstrap-permissions.sh
 ```
 
-Load it into RDS (before the new version starts, so the tables don't exist yet):
+It ends with `Done. Role ARN: …`. It may list the inline policy you pasted in step 9; that one is
+now covered by `RiskRunnerDeploySsm` and can be deleted.
+
+### 2. Run the workflow from the branch
+GitHub → Risk-Runner → Actions → **Deploy to AWS** → **Run workflow** → Branch:
+`feat/serverless-ingest` → **Run workflow**. It takes about 20 minutes the first time:
+
+| Job | What it does | Typical time |
+|---|---|---|
+| `database` | Creates the RDS database and the `RDS_MASTER_PASSWORD` / `RISK_RUNNER_DATABASE_URL` parameters | ~10 min first time |
+| `migrate` | On the instance: dumps the old Postgres container and restores it into RDS, then prints row counts from both. Skips if RDS already has data. | ~1 min |
+| `deploy` | Checks out the branch on the instance, starts the new version (no Postgres container) and runs the health check | ~5 min |
+| `deploy-ingest` | Deploys the Lambda stack. The run's **Summary** shows the ingest URL | ~5 min |
+
+**While you're testing, don't push to `main`.** That runs `main`'s version of the workflow,
+which puts the old version back on the server (the same as a rollback, below).
+
+Check the result:
+- The `migrate` job's *Server output* shows the row counts (old | RDS); they should match.
+- The dashboard still shows your repositories, findings, triage decisions and business context.
+
+### 3. Try serverless ingestion on one repository
+In a scanned repository: add the `RISK_RUNNER_INGEST_URL` secret with the command from the run's
+Summary, and change its upload step to
+
+```yaml
+uses: GITHUB_OWNER/Risk-Runner/action@feat/serverless-ingest   # ingest-url isn't on main yet
+with:
+  ingest-url: ${{ secrets.RISK_RUNNER_INGEST_URL }}
+  token: ${{ secrets.RISK_RUNNER_TOKEN }}
+  report: …
+```
+
+Push to its default branch and check the upload step's log and the dashboard. Repositories that
+still use `server-url` keep working.
+
+### 4. Merge
+When you're happy: merge the branch (the push to `main` runs the workflow again; every job
+finds nothing to change), change test repositories back to `action@main`, and rerun step 1
+**without** `BRANCH=…` so only `main` can deploy.
+
+### Doing it by hand instead
+The same scripts work without the workflow, one at a time: `deploy/aws/database/deploy.sh` in
+CloudShell (step 5a), then on the instance (Session Manager, `sudo -iu ubuntu`, `cd ~/Risk-Runner`):
+`git fetch origin && git show origin/feat/serverless-ingest:deploy/aws/migrate-to-rds.sh | AWS_REGION=REGION bash`,
+then `git checkout feat/serverless-ingest && AWS_REGION=REGION ./deploy/deploy.sh`, and part H
+step 2 for the Lambda stack.
+
+To look inside the RDS database from the instance:
 
 ```bash
 PGURL=$(aws ssm get-parameter --region REGION --with-decryption --name /risk-runner/RISK_RUNNER_DATABASE_URL --query Parameter.Value --output text | sed 's/+psycopg//')
 ```
 
 ```bash
-docker run --rm -i postgres:17 pg_restore --no-owner --no-privileges -d "$PGURL" < ~/risk_runner.dump
+docker run --rm -it --network host postgres:17 psql "$PGURL"
 ```
 
-No output means it worked. Scans uploaded between the dump and step 3 aren't copied; rerun those
-scans afterwards.
+Then for example `select count(*) from findings;`.
 
-### 3. Deploy the new version of the server
-
-```bash
-cd ~/Risk-Runner && git fetch origin && git checkout feat/serverless-ingest && AWS_REGION=REGION ./deploy/deploy.sh
-```
-
-(After merging, use `git checkout main && git pull` instead.) The old `db` container is removed;
-its volume (`risk-runner_pgdata`) is kept. Open the dashboard: the repositories, findings,
-triage decisions and business context should all be there.
-
-To look inside the RDS database: `docker run --rm -it postgres:17 psql "$PGURL"`, then for
-example `select count(*) from findings;`.
-
-### 4. Deploy serverless ingestion (optional)
-Follow [part H](#h-serverless-ingestion-lambda), step 1. When trying the branch, clone it in CloudShell:
-
-```bash
-git clone -b feat/serverless-ingest https://github.com/GITHUB_OWNER/Risk-Runner.git ~/Risk-Runner
-```
-
-Then point one test repository at it (part H, step 3, with `action@feat/serverless-ingest`),
-push to its default branch and check the upload step and the dashboard.
-
-### 5. Roll back if something is wrong
-On the instance:
-
-```bash
-cd ~/Risk-Runner && git checkout main && AWS_REGION=REGION ./deploy/deploy.sh
-```
-
-This starts the old Postgres container again on its untouched volume. Anything uploaded while
+### Roll back if something is wrong
+Actions → **Deploy to AWS** → **Run workflow** → Branch: `main`. (Before merging, `main` still
+has the old version.) This starts the old Postgres container again on its untouched volume. Anything uploaded while
 running on RDS isn't in it; rerun those scans. Change test repos back to `action@main` and
 `server-url`. The RDS database and the `risk-runner-ingest` stack can stay (they cost money) or
-be deleted (see part G).
+be deleted (see part G). To try again later, just run the workflow on the branch again: the
+`migrate` job skips the copy because RDS already has data, so anything uploaded to the old
+database after the first copy stays there.
 
-### 6. Clean up once you're sure
-After a week or two on RDS:
+### Clean up once you're sure
+After a week or two on RDS, on the instance:
 
 ```bash
-docker volume rm risk-runner_pgdata && rm ~/risk_runner.dump
+docker volume rm risk-runner_pgdata && rm ~/risk_runner-*.dump
 ```
 
 ```bash

@@ -1,0 +1,92 @@
+# Amazon RDS for PostgreSQL for Risk Runner. Deploy with ./deploy.sh next to this file
+# (the Deploy to AWS workflow runs it on every deploy; it's a no-op when nothing changed).
+#
+# Kept in its own stack so that deleting or replacing the ingest stack never touches the data.
+# Deleting this stack takes a final snapshot, and deletion protection is on.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Risk Runner database (RDS PostgreSQL)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC of the EC2 instance.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in different availability zones, in that VPC.
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group of the EC2 instance. It gets access to port 5432.
+  MasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    AllowedPattern: "[0-9a-fA-F]+"
+    Description: Hex characters only, so it can go in a URL unescaped.
+  InstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+  MaxAllocatedStorage:
+    Type: Number
+    Default: 50
+
+Resources:
+  SubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: risk-runner
+      DBSubnetGroupDescription: Risk Runner database subnets
+      SubnetIds: !Ref SubnetIds
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Risk Runner database
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Risk Runner web server
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroupId
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Metadata:
+      cfn-lint:
+        config:
+          # W3691: a major version alone ("17") lets RDS pick its default 17.x minor version.
+          # W1011: the password comes from Parameter Store via deploy.sh (NoEcho parameter).
+          ignore_checks: [W3691, W1011]
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: risk-runner
+      Engine: postgres
+      EngineVersion: "17"
+      DBInstanceClass: !Ref InstanceClass
+      StorageType: gp3
+      AllocatedStorage: !Ref AllocatedStorage
+      MaxAllocatedStorage: !Ref MaxAllocatedStorage
+      StorageEncrypted: true
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref SubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      DBName: risk_runner
+      MasterUsername: risk
+      MasterUserPassword: !Ref MasterPassword
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+
+Outputs:
+  Endpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  Port:
+    Value: !GetAtt Database.Endpoint.Port
+  SecurityGroupId:
+    Value: !Ref DatabaseSecurityGroup

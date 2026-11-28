@@ -1,7 +1,17 @@
-# Deploys Risk Runner to a single EC2 instance on every push to main (after tests pass).
+# Deploys Risk Runner to AWS on every push to main (after tests pass), or on demand
+# (Actions > Deploy to AWS > Run workflow, which also lets you pick a branch to try).
 #
-# - Signs in to AWS with GitHub OIDC (no AWS keys stored in GitHub).
-# - Sends the deploy through AWS Systems Manager Run Command (SSH can stay closed).
+#   test ─▶ database ─▶ migrate ─▶ deploy (EC2 web server + health check)
+#              └──────▶ deploy-ingest (S3 + SQS + Lambda)
+#
+# Every job is safe to rerun and does nothing when there's nothing to change:
+# - database:      creates/updates the RDS stack (deploy/aws/database) and the database URL parameter.
+# - migrate:       copies data from the old Postgres container into RDS, once (deploy/aws/migrate-to-rds.sh).
+# - deploy:        checks out this commit on the instance and runs deploy/deploy.sh, through SSM.
+# - deploy-ingest: deploys the serverless ingest stack (deploy/aws/serverless).
+#
+# - Signs in to AWS with GitHub OIDC (no AWS keys stored in GitHub). What the role may do is set
+#   by deploy/aws/bootstrap-permissions.sh, which you run yourself.
 # - The server reads its secrets from SSM Parameter Store (SecureString, KMS-encrypted).
 #
 # Repository variables (Settings > Secrets and variables > Actions > Variables):
@@ -10,8 +20,8 @@
 #   EC2_INSTANCE_ID      e.g. i-0123456789abcdef0
 #   DOMAIN               e.g. riskrunner.example.com (used for the health check)
 #   APP_DIR              optional, defaults to /home/ubuntu/Risk-Runner
-#   SERVERLESS_INGEST    "true" to also deploy deploy/aws/serverless (S3 + SQS + Lambda ingest)
-# The deploy job is skipped until EC2_INSTANCE_ID is set.
+#   SERVERLESS_INGEST    optional, "false" to skip the serverless ingest stack
+# Nothing is deployed until EC2_INSTANCE_ID is set.
 name: Deploy to AWS
 
 on:
@@ -26,13 +36,79 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+  APP_DIR: ${{ vars.APP_DIR || '/home/ubuntu/Risk-Runner' }}
+
 jobs:
   test:
     uses: ./.github/workflows/ci.yml
 
-  deploy-ingest:
+  database:
     needs: test
-    if: vars.SERVERLESS_INGEST == 'true'
+    if: vars.EC2_INSTANCE_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45 # creating the database takes about 10 minutes
+    permissions:
+      contents: read
+      id-token: write # lets the job request a GitHub OIDC token for AWS
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Create or update the RDS database
+        run: ./deploy/aws/database/deploy.sh
+
+  migrate:
+    needs: database
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Copy data from the old Postgres container into RDS (once)
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          # Runs this commit's script without checking it out, so the old app keeps running until
+          # the data is copied.
+          script="sudo -u ubuntu -H bash -c 'set -e; cd $APP_DIR; git fetch --quiet origin; git show $SHA:deploy/aws/migrate-to-rds.sh | AWS_REGION=$AWS_REGION AWS_DEFAULT_REGION=$AWS_REGION APP_DIR=$APP_DIR bash'"
+          ./deploy/aws/ssm-run.sh "Risk Runner migrate ${SHA:0:7}" "$script"
+
+  deploy:
+    needs: migrate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy through SSM Run Command
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          script="sudo -u ubuntu -H bash -c 'set -e; cd $APP_DIR; git fetch --quiet origin; git checkout --quiet --force $SHA; AWS_REGION=$AWS_REGION ./deploy/deploy.sh'"
+          ./deploy/aws/ssm-run.sh "Risk Runner ${SHA:0:7}" "$script"
+      - name: Health check
+        run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "https://${{ vars.DOMAIN }}/api/health"
+
+  deploy-ingest:
+    needs: database
+    if: vars.SERVERLESS_INGEST != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -47,52 +123,3 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
       - name: Deploy the serverless ingest stack
         run: ./deploy/aws/serverless/deploy.sh
-
-  deploy:
-    needs: test
-    if: vars.EC2_INSTANCE_ID != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      id-token: write # lets the job request a GitHub OIDC token for AWS
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Deploy through SSM Run Command
-        env:
-          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-          APP_DIR: ${{ vars.APP_DIR || '/home/ubuntu/Risk-Runner' }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          script="sudo -u ubuntu -H bash -c 'set -e; cd $APP_DIR; git fetch --quiet origin; git checkout --quiet --force $SHA; AWS_REGION=$AWS_REGION ./deploy/deploy.sh'"
-          params=$(jq -n --arg c "$script" '{commands: [$c], executionTimeout: ["1800"]}')
-          id=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name AWS-RunShellScript \
-            --comment "Risk Runner ${SHA:0:7}" \
-            --parameters "$params" \
-            --query Command.CommandId --output text)
-          echo "SSM command $id"
-
-          status=Pending
-          for _ in $(seq 1 150); do
-            sleep 10
-            status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE_ID" \
-              --query Status --output text 2>/dev/null || echo Pending)
-            case "$status" in Success|Failed|Cancelled|TimedOut|Undeliverable|Terminated) break ;; esac
-          done
-
-          echo "::group::Server output"
-          aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE_ID" \
-            --query '[StandardOutputContent, StandardErrorContent]' --output text || true
-          echo "::endgroup::"
-          echo "Deploy status: $status"
-          [ "$status" = Success ]
-
-      - name: Health check
-        run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "https://${{ vars.DOMAIN }}/api/health"
