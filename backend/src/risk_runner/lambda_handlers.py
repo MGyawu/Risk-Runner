@@ -179,18 +179,6 @@ class ReportRejected(Exception):
     """The report can't be ingested. Retrying won't help, so the upload is marked failed."""
 
 
-def _lock_repository(session, full_name: str) -> None:
-    """Serialize concurrent ingests of the same repository until the transaction commits.
-
-    Up to two processor invocations run at once (SQS maximum concurrency). Without this lock, two
-    reports for one repository could both create the repository or both mark the same findings.
-    """
-    from sqlalchemy import text
-
-    if session.get_bind().dialect.name == "postgresql":
-        session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:name))"), {"name": full_name})
-
-
 def process_upload(upload_id: str) -> dict:
     """Ingest one uploaded report. Returns the result written to ``results/<id>.json``."""
     global _db_ready
@@ -221,7 +209,6 @@ def process_upload(upload_id: str) -> dict:
             db.init_db()
             _db_ready = True
         with db.SessionLocal() as session:
-            _lock_repository(session, meta["repository"])
             try:
                 scan, cves = ingest_report(
                     session,

@@ -1,11 +1,24 @@
 """Ingest a scanner report: parse, dedupe, track lifecycle, score."""
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .models import Finding, FindingStatus, Repository, Scan, utcnow
 from .parsers import parse_report
 from .scoring import rescore_repo
+
+
+def lock_repository(session: Session, full_name: str) -> None:
+    """Make ingests of one repository take turns until this transaction commits or rolls back.
+
+    Ingest reads the repository's findings, decides what's new or fixed, then writes. Two uploads
+    for the same repository at once (web server and Lambda, or two Lambdas) could otherwise both
+    create the repository or the same finding, or close findings the other just saw. Uploads for
+    different repositories don't wait for each other. SQLite (tests, local dev) has no advisory
+    locks and serializes writes itself, so this is skipped there.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:name))"), {"name": full_name})
 
 
 def get_or_create_repo(session: Session, full_name: str) -> Repository:
@@ -37,6 +50,7 @@ def ingest_report(
             p.tool = tool
     tool_name = tool or (parsed[0].tool if parsed else fmt)
 
+    lock_repository(session, repository)  # waits here while another upload is writing this repository
     repo = get_or_create_repo(session, repository)
     if default_branch:  # reported by the uploader (GitHub knows the real default branch)
         repo.default_branch = default_branch
@@ -97,6 +111,6 @@ def ingest_report(
         fixed_count=fixed_count,
     )
     session.add(scan)
-    session.commit()
+    session.commit()  # releases the lock
     rescore_repo(session, repo)
     return scan, sorted({p.cve for p in parsed if p.cve})
