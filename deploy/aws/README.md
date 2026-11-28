@@ -628,9 +628,11 @@ Action ─GET /uploads/{id}─▶ API Lambda ─▶ result (score, counts)  (pol
 - The processor has no internet access, so it doesn't fetch CVE intel. The web server checks
   every 10 minutes for CVEs without intel (`RISK_RUNNER_PENDING_ENRICHMENT_MINUTES`) and
   enriches them. No NAT gateway (about $33 a month) is needed.
-- At most two reports are processed at once, and reports for the same repository wait for each
+- At most two reports are processed at once. Reports for the same repository wait for each
   other (a database lock), so lifecycle changes don't conflict.
-- The web server's `POST /api/v1/ingest` keeps working. Repos can move over one at a time.
+- The web server's `POST /api/v1/ingest` keeps working, and you can ingest while the dashboard is
+  in use. Uploads to either one share the same lock, so a web upload and a Lambda upload for one
+  repository also take turns. Repos can move over one at a time.
 
 Requires the RDS database from step 5a, named `risk-runner`.
 
